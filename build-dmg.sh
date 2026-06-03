@@ -3,10 +3,12 @@
 #
 # - Bumps the patch component of package.json's version before each build.
 # - Runs electron-packager so the new version is baked into the .app's Info.plist.
-# - If a Developer ID Application cert is in the keychain AND a matching
-#   notarytool keychain profile exists, signs with hardened runtime + notarizes +
-#   staples. Otherwise falls back to ad-hoc signing (recipient sees "developer
-#   cannot be verified" → right-click→Open).
+# - If a Developer ID Application cert is in the keychain, signs the .app and
+#   DMG with hardened runtime. Otherwise falls back to ad-hoc signing
+#   (recipient sees "developer cannot be verified" → right-click→Open).
+# - Notarization is OPT-IN: set BPING_NOTARIZE=1 to submit to Apple's notary
+#   service + staple. Without it, the build is signed-but-not-notarized
+#   (Gatekeeper will warn on first launch; right-click→Open dismisses).
 # - Removes any prior bping-v*.dmg (and any unversioned legacy bping.dmg) from
 #   the build dir and deploy targets, so only one DMG of each kind is kept.
 # - Deploys app + new DMG to ~/Documents/bping-apps/ and ~/Desktop/.
@@ -14,6 +16,7 @@
 # Env overrides:
 #   BPING_SIGN_ID         — codesign identity (default: Developer ID Application: Vid Tadel ...)
 #   BPING_NOTARY_PROFILE  — notarytool keychain profile name (default: bping-notary)
+#   BPING_NOTARIZE=1      — submit to Apple notary + staple (default: skip)
 #   BPING_SKIP_BUMP=1     — don't bump the version (rebuild current version)
 set -euo pipefail
 
@@ -84,16 +87,20 @@ if [ "$MODE" = "developerid" ]; then
   codesign --verify --deep --strict "$APP"
   echo "==> Signed."
 
-  echo "==> Notarizing $APP (Apple notary queue — typically 1–3 min)…"
-  ZIP="$DIST/bping-for-notary.zip"
-  rm -f "$ZIP"
-  ditto -c -k --keepParent "$APP" "$ZIP"
-  OUT="$(xcrun notarytool submit "$ZIP" --keychain-profile "$NOTARY_PROFILE" --wait 2>&1)"
-  echo "$OUT"
-  rm -f "$ZIP"
-  echo "$OUT" | grep -q "status: Accepted" || { echo "Notarization NOT accepted"; exit 1; }
-  xcrun stapler staple "$APP"
-  echo "==> Stapled."
+  if [ "${BPING_NOTARIZE:-0}" = "1" ]; then
+    echo "==> Notarizing $APP (Apple notary queue — typically 1–3 min)…"
+    ZIP="$DIST/bping-for-notary.zip"
+    rm -f "$ZIP"
+    ditto -c -k --keepParent "$APP" "$ZIP"
+    OUT="$(xcrun notarytool submit "$ZIP" --keychain-profile "$NOTARY_PROFILE" --wait 2>&1)"
+    echo "$OUT"
+    rm -f "$ZIP"
+    echo "$OUT" | grep -q "status: Accepted" || { echo "Notarization NOT accepted"; exit 1; }
+    xcrun stapler staple "$APP"
+    echo "==> Stapled."
+  else
+    echo "==> Skipping notarization (set BPING_NOTARIZE=1 to enable)."
+  fi
 else
   codesign --force --deep --sign - --timestamp=none "$APP" >/dev/null
   codesign --verify --deep --strict "$APP" || { echo "ad-hoc verify failed"; exit 1; }
@@ -109,13 +116,18 @@ rm -f "$DMG"
 hdiutil create -volname "bping" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
 
 if [ "$MODE" = "developerid" ]; then
-  echo "==> Signing + notarizing $DMG"
+  echo "==> Signing $DMG"
   codesign --force --timestamp --sign "$ID" "$DMG"
-  OUT="$(xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" --wait 2>&1)"
-  echo "$OUT"
-  echo "$OUT" | grep -q "status: Accepted" || { echo "DMG notarization NOT accepted"; exit 1; }
-  xcrun stapler staple "$DMG"
-  echo "==> DMG stapled — recipients double-click without Gatekeeper warnings."
+  if [ "${BPING_NOTARIZE:-0}" = "1" ]; then
+    echo "==> Notarizing $DMG"
+    OUT="$(xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" --wait 2>&1)"
+    echo "$OUT"
+    echo "$OUT" | grep -q "status: Accepted" || { echo "DMG notarization NOT accepted"; exit 1; }
+    xcrun stapler staple "$DMG"
+    echo "==> DMG stapled — recipients double-click without Gatekeeper warnings."
+  else
+    echo "==> DMG signed but not notarized (set BPING_NOTARIZE=1 to enable)."
+  fi
 fi
 
 # --- Remove ALL prior DMGs (versioned + legacy unversioned) ----------------
