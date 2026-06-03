@@ -665,30 +665,28 @@ function isImageAttachment(att) {
 
 // HTML body of a single line — text content, attachments, or both.
 // Used for both Forward and Copy. Attachment-only lines (Chat::Lines::Upload)
-// have content==null and a populated attachments[]; render each attachment
-// as a clickable filename so the recipient can view the original.
+// have content==null and a populated attachments[].
 //
-// opts.embedImages — when true (Copy), images with a pre-fetched _dataUri
-// are inlined as <img src="data:..."> so pasting into Mail/Notes shows the
-// real image. Falls back to the filename link if no data URI (download
-// failed, file too big, or non-image). Forward leaves this off because
-// Basecamp's chat-line HTML strips <img>.
+// opts.bcAttachments — when true (Copy), each attachment with a pre-fetched
+// _sgid is rendered as <bc-attachment sgid="..."> so pasting into another
+// Basecamp document/comment embeds the file inline with Basecamp's native
+// preview (image thumbnails, file pills). Falls back to a filename link if
+// the re-upload didn't succeed. Forward leaves this off because chat lines
+// reject bc-attachment with HTTP 422.
 function lineBodyHtml(line, opts) {
-  const embedImages = !!(opts && opts.embedImages);
+  const bcAttachments = !!(opts && opts.bcAttachments);
   const parts = [];
   if (line.content) parts.push(cleanForwardHtml(line.content));
   for (const a of (line.attachments || [])) {
+    if (bcAttachments && a._sgid) {
+      parts.push(`<bc-attachment sgid="${esc(a._sgid)}"></bc-attachment>`);
+      continue;
+    }
     const label = esc(attachmentLabel(a));
     const href = attachmentHref(line, a);
-    const link = href
+    parts.push(href
       ? `<div>📎 <a href="${esc(href)}">${label}</a></div>`
-      : `<div>📎 ${label}</div>`;
-    if (embedImages && isImageAttachment(a) && a._dataUri) {
-      // Image inlined for paste; link below as a fallback/caption.
-      parts.push(`<div><img src="${a._dataUri}" alt="${label}" style="max-width:640px;height:auto;display:block;"></div>${link}`);
-    } else {
-      parts.push(link);
-    }
+      : `<div>📎 ${label}</div>`);
   }
   return parts.join('');
 }
@@ -830,44 +828,45 @@ async function runCopy() {
   if (fwdSending || !fwdLines.length) return;
   fwdSending = true;
 
-  // Pre-fetch every image attachment so it can be inlined as a data URI in
-  // the clipboard HTML. Pasting into Mail / Notes / rich text editors will
-  // then render the image directly, without needing Basecamp cookies on the
-  // paste target. Non-image attachments stay as filename links.
-  const MAX_BYTES_PER_IMAGE = 5 * 1024 * 1024;   // 5 MB cap per image
-  const imgs = [];
+  // Re-upload every attachment so it has its own Basecamp Attachment sgid.
+  // We assume the user is only pasting into Basecamp surfaces (docs,
+  // messages, comments), so embedding <bc-attachment sgid="..."> gives a
+  // proper inline preview — far better than the data-URI approach we used
+  // before (which only worked in Mail/Notes and got stripped by Basecamp).
+  //
+  // 5 MB per-file cap keeps the round trip snappy; failed re-uploads fall
+  // through to a filename link in the composer.
+  const MAX_BYTES = 5 * 1024 * 1024;
+  const atts = [];
   for (const l of fwdLines) {
     for (const a of (l.attachments || [])) {
-      if (isImageAttachment(a) && a.download_url) imgs.push(a);
+      if (a && a.download_url) atts.push(a);
     }
   }
-  if (imgs.length) {
-    setFwdStatus(`Downloading ${imgs.length} image${imgs.length === 1 ? '' : 's'}…`);
+  if (atts.length) {
+    setFwdStatus(`Re-uploading ${atts.length} attachment${atts.length === 1 ? '' : 's'} (download + upload)…`);
     let done = 0, i = 0;
     const CONCURRENCY = 4;
     async function worker() {
-      while (i < imgs.length) {
-        const a = imgs[i++];
+      while (i < atts.length) {
+        const a = atts[i++];
         try {
-          const fr = await bp.fetchAttachment(a.download_url, MAX_BYTES_PER_IMAGE);
-          if (fr && fr.ok) a._dataUri = `data:${fr.mime};base64,${fr.base64}`;
+          const r = await bp.reuploadAttachment(
+            a.download_url, a.filename || a.title || 'attachment', a.content_type, MAX_BYTES);
+          if (r && r.ok && r.sgid) a._sgid = r.sgid;
         } catch (e) { /* fall through to link */ }
         done++;
-        setFwdStatus(`Downloading ${done}/${imgs.length} image${imgs.length === 1 ? '' : 's'}…`);
+        setFwdStatus(`Re-uploading ${done}/${atts.length} attachment${atts.length === 1 ? '' : 's'}…`);
       }
     }
     await Promise.all(Array.from({ length: CONCURRENCY }, worker));
   }
 
-  // HTML inlines images (embedImages: true). Plain text always falls back to
-  // the filename + URL since text clipboards can't hold image data.
-  const html = composeForwardHtml(fwdLines, { embedImages: true });
+  // HTML embeds attachments as <bc-attachment sgid="..."> (paste-into-Basecamp
+  // friendly). Plain text always lists filename + URL since text clipboards
+  // can't hold attachment data.
+  const html = composeForwardHtml(fwdLines, { bcAttachments: true });
   const text = composeCopyText(fwdLines);
-  // Doc copy: Basecamp doc content allows rich text but not data: URIs in
-  // <img src> (it sanitizes attachments to its own bc-attachment scheme), so
-  // we save the link-only variant — same shape as Forward. Image data stays
-  // on the clipboard for the user to paste elsewhere.
-  const docHtml = composeForwardHtml(fwdLines);
   setFwdStatus('Writing to clipboard…');
   let cw;
   try { cw = await bp.writeClipboard(text, html); }
@@ -877,17 +876,6 @@ async function runCopy() {
     fwdSending = false;
     return;
   }
-  // Save a copy as a new published doc in the Tmp project — gives the user a
-  // browsable archive of every Copy run. Title is the source chat + a
-  // local-time stamp so it's easy to spot. If the save fails we still
-  // succeeded at the clipboard write, so report the partial outcome.
-  const docTitle = `From ${current.name} — ${nowStamp()}`;
-  setFwdStatus(`Saving to Tmp as "${docTitle}"…`);
-  let nr;
-  try { nr = await bp.saveCopyToNotes(docTitle, docHtml); }
-  catch (e) { nr = { error: e.message }; }
-  const docOk  = !!(nr && nr.ok && nr.app_url);
-  const docUrl = docOk ? nr.app_url : '';
 
   // Auto-DELETE each bookmark.
   let removed = 0, kept = 0;
@@ -896,25 +884,18 @@ async function runCopy() {
     if (dr && dr.ok) removed++; else kept++;
   }
   const n = fwdLines.length;
-  const bmNote = kept === 0
-    ? 'Bookmarks cleared.'
-    : `${kept} bookmark${kept === 1 ? '' : 's'} couldn't be auto-removed — un-bookmark in Basecamp manually.`;
-  if (docOk) {
-    setFwdStatus(`Copied ${n} message${n === 1 ? '' : 's'} to clipboard. Saved to Tmp: ${docTitle}. ${bmNote}`, true);
-    // Pop a new bping window with Basecamp pointed at the freshly-created doc,
-    // sharing the same webview session so it's already logged in.
-    bp.openBasecampWindow(docUrl);
+  const attMissing = atts.length - atts.filter(a => a._sgid).length;
+  const attNote = atts.length === 0
+    ? ''
+    : (attMissing === 0
+        ? ` (incl. ${atts.length} attachment${atts.length === 1 ? '' : 's'})`
+        : ` (${atts.length - attMissing}/${atts.length} attachments embedded; ${attMissing} fell back to links)`);
+  if (kept === 0) {
+    setFwdStatus(`Copied ${n} message${n === 1 ? '' : 's'} to clipboard${attNote}. Bookmarks cleared.`, true);
   } else {
-    setFwdStatus(`Copied ${n} message${n === 1 ? '' : 's'} to clipboard, but couldn't save to Tmp: ${(nr && nr.error) || 'unknown'}. ${bmNote}`, true);
+    setFwdStatus(`Copied ${n} message${n === 1 ? '' : 's'} to clipboard${attNote}. ${kept} bookmark${kept === 1 ? '' : 's'} couldn't be auto-removed — un-bookmark in Basecamp manually.`, true);
   }
-  setTimeout(closeForward, 2400);
-}
-
-// Local-timezone "YYYY-MM-DD HH:MM" stamp for the saved doc title.
-function nowStamp() {
-  const d = new Date();
-  const pad = n => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  setTimeout(closeForward, 2200);
 }
 
 $('#forwardBtn').onclick = openForward;

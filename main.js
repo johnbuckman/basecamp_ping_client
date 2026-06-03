@@ -245,17 +245,17 @@ async function unbookmarkUrl(bookmarkUrl) {
   } catch (e) { return false; }
 }
 
-// Fetch a Basecamp attachment as a base64 data URI. Used by the Copy feature
-// to inline images into the clipboard HTML so that pasting into Mail / Notes /
-// rich text editors renders the image inline (no Basecamp login needed by the
-// paste target).
+// Fetch a Basecamp attachment as raw bytes + content type. Used by the Copy
+// feature to re-upload each attachment as a fresh Basecamp Upload resource,
+// whose attachable_sgid can then be embedded as <bc-attachment> in the
+// clipboard HTML (Basecamp's docs/comments render that inline with previews).
 //
 // Follows redirects manually because the bearer token MUST be dropped on the
 // `*.basecampapi.com` → `storage.basecamp.com` hop (S3 returns
 // `objectNameNotDecodedYet` if we forward the bearer). The Location string is
 // used as-is — running it through `new URL().toString()` re-encodes the
 // signed-URL query and breaks the signature.
-async function fetchAttachmentDataUri(url, maxBytes) {
+async function fetchAttachmentBytes(url, maxBytes) {
   const allowed = /^https:\/\/([a-z0-9-]+\.basecampapi\.com|[a-z0-9-]+\.basecamp-static\.com|preview\.app\.basecamp\.com|storage\.basecamp\.com)\//i;
   if (!allowed.test(url)) return null;
   await validToken();
@@ -285,66 +285,42 @@ async function fetchAttachmentDataUri(url, maxBytes) {
   const buf = Buffer.from(ab);
   if (maxBytes && buf.length > maxBytes) return null;
   const mime = (r.headers.get('content-type') || 'application/octet-stream').split(';')[0].trim();
-  return { mime, base64: buf.toString('base64'), bytes: buf.length };
+  return { buffer: buf, mime, bytes: buf.length };
 }
 
-// --- Notes destination (Tmp project) ---------------------------------------
-// The Copy feature also stashes each copy as a fresh document in the user's
-// "Tmp" project for archival / quick access. The project's bucket + vault
-// IDs are looked up by name on first use and cached in memory (cleared on
-// signout / next process start).
-let tmpProjectCache = null;     // { bucketId, vaultId, appUrl }
-async function findTmpProject() {
-  if (tmpProjectCache) return tmpProjectCache;
-  for (let page = 1; page <= 10; page++) {
-    let p; try { p = await api(`/projects.json?page=${page}`); } catch (e) { break; }
-    if (!Array.isArray(p) || !p.length) break;
-    for (const proj of p) {
-      if (proj.name && proj.name.trim().toLowerCase() === 'tmp') {
-        const vault = (proj.dock || []).find(d => d.name === 'vault');
-        if (!vault) throw new Error('Tmp project has no Docs & Files vault');
-        tmpProjectCache = { bucketId: proj.id, vaultId: vault.id, appUrl: proj.app_url };
-        return tmpProjectCache;
-      }
-    }
-    if (p.length < 15) break;
+// POST raw bytes to /attachments.json — Basecamp creates a fresh Attachment
+// resource and returns its attachable_sgid, which is the value we need for
+// <bc-attachment sgid="..."> in document/comment HTML.
+async function uploadAttachmentBytes(buffer, mime, filename) {
+  await validToken();
+  const url = `${API_ROOT}/${config.accountId}/attachments.json?name=${encodeURIComponent(filename)}`;
+  const headers = {
+    Authorization: 'Bearer ' + tokens.access_token,
+    'User-Agent': UA,
+    'Content-Type': mime || 'application/octet-stream',
+    'Content-Length': String(buffer.length),
+    Accept: 'application/json',
+  };
+  let r = await fetch(url, { method: 'POST', headers, body: buffer });
+  if (r.status === 401) {
+    await refreshTokens();
+    headers.Authorization = 'Bearer ' + tokens.access_token;
+    r = await fetch(url, { method: 'POST', headers, body: buffer });
   }
-  throw new Error('No project named "Tmp" — create one in Basecamp first.');
-}
-
-// Create a published (status:active) document in the Tmp project's vault.
-// status:active is critical — without it the doc is created as a draft and
-// the user won't see it (per bc3-api/sections/documents.md).
-async function createCopyDoc(title, content) {
-  const tmp = await findTmpProject();
-  const r = await apiSend(`/buckets/${tmp.bucketId}/vaults/${tmp.vaultId}/documents.json`,
-    'POST', { title, content, status: 'active' });
   if (!r.ok) {
     const txt = await r.text().catch(() => '');
-    throw new Error('create doc HTTP ' + r.status + (txt ? ' — ' + txt.slice(0, 200) : ''));
+    throw new Error('attachment upload HTTP ' + r.status + (txt ? ' — ' + txt.slice(0, 200) : ''));
   }
-  return await r.json();
+  const j = await r.json();
+  return j && j.attachable_sgid ? j.attachable_sgid : null;
 }
 
-// Open a Basecamp URL in a new top-level Electron window, sharing the same
-// persist:basecamp session as the main window's chat webview so the user is
-// already logged in. Top-level navigation doesn't need the X-Frame-Options
-// stripping the embedded webview does.
-function openBasecampWindow(url) {
-  if (!url || !/^https?:\/\//.test(url)) return null;
-  const win = new BrowserWindow({
-    width: 1100,
-    height: 800,
-    title: 'Basecamp',
-    webPreferences: {
-      session: session.fromPartition(PARTITION),
-      sandbox: true,
-      contextIsolation: true,
-      nodeIntegration: false,
-    },
-  });
-  win.loadURL(url);
-  return win;
+// Download a chat-line attachment from `downloadUrl`, re-upload it as a fresh
+// Basecamp Attachment, return the new attachable_sgid (or null on failure).
+async function reuploadAttachment(downloadUrl, filename, fallbackMime, maxBytes) {
+  const got = await fetchAttachmentBytes(downloadUrl, maxBytes);
+  if (!got) return null;
+  return await uploadAttachmentBytes(got.buffer, got.mime || fallbackMime, filename || 'attachment');
 }
 
 async function sendChatLine(bucket, chat, html) {
@@ -511,7 +487,6 @@ ipcMain.handle('signout', async () => {
   try { writeJSON(CFG_PATH, config); } catch (e) {}
   me = null; identityCache = null;
   peopleCache = { at: 0, list: [] };
-  tmpProjectCache = null;
   // Clear the webview's Basecamp session too, otherwise the right pane stays logged in.
   try { await session.fromPartition(PARTITION).clearStorageData(); } catch (e) {}
   return { ok: true };
@@ -543,24 +518,11 @@ ipcMain.handle('api:send-line', async (_e, { bucket, chat, html } = {}) => {
   try { const line = await sendChatLine(bucket, chat, html); return { ok: true, line }; }
   catch (e) { return { error: e.message }; }
 });
-ipcMain.handle('notes:write', async (_e, { title, content } = {}) => {
-  if (!config.accountId) return { error: 'no account selected' };
-  if (!title || !content) return { error: 'missing title/content' };
+ipcMain.handle('attachment:reupload', async (_e, { downloadUrl, filename, mime, maxBytes } = {}) => {
+  if (!downloadUrl) return { error: 'no downloadUrl' };
   try {
-    const doc = await createCopyDoc(title, content);
-    return { ok: true, app_url: doc.app_url, id: doc.id, title: doc.title };
-  } catch (e) { return { error: e.message }; }
-});
-ipcMain.handle('window:open-basecamp', (_e, { url } = {}) => {
-  try { openBasecampWindow(url); return { ok: true }; }
-  catch (e) { return { ok: false, error: e.message }; }
-});
-ipcMain.handle('attachment:fetch', async (_e, { url, maxBytes } = {}) => {
-  if (!url) return { error: 'no url' };
-  try {
-    const r = await fetchAttachmentDataUri(url, maxBytes || 0);
-    if (!r) return { error: 'fetch failed or too large' };
-    return { ok: true, mime: r.mime, base64: r.base64, bytes: r.bytes };
+    const sgid = await reuploadAttachment(downloadUrl, filename, mime, maxBytes || 0);
+    return sgid ? { ok: true, sgid } : { error: 'fetch or upload failed' };
   } catch (e) { return { error: e.message }; }
 });
 ipcMain.handle('clipboard:write', (_e, { text, html } = {}) => {
