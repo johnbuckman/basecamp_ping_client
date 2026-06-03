@@ -23,4 +23,6 @@ contextBridge.exposeInMainWorld('bping', {
   writeClipboard: (text, html) => ipcRenderer.invoke('clipboard:write', { text, html }),
   reuploadAttachment: (downloadUrl, filename, mime, maxBytes) =>
     ipcRenderer.invoke('attachment:reupload', { downloadUrl, filename, mime, maxBytes }),
+  fetchAttachmentDataUri: (url, maxBytes) =>
+    ipcRenderer.invoke('attachment:dataUri', { url, maxBytes }),
 });

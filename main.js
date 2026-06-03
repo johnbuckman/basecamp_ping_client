@@ -525,6 +525,14 @@ ipcMain.handle('attachment:reupload', async (_e, { downloadUrl, filename, mime, 
     return sgid ? { ok: true, sgid } : { error: 'fetch or upload failed' };
   } catch (e) { return { error: e.message }; }
 });
+ipcMain.handle('attachment:dataUri', async (_e, { url, maxBytes } = {}) => {
+  if (!url) return { error: 'no url' };
+  try {
+    const r = await fetchAttachmentBytes(url, maxBytes || 0);
+    if (!r) return { error: 'fetch failed or too large' };
+    return { ok: true, mime: r.mime, base64: r.buffer.toString('base64'), bytes: r.bytes };
+  } catch (e) { return { error: e.message }; }
+});
 ipcMain.handle('clipboard:write', (_e, { text, html } = {}) => {
   try {
     // Electron's clipboard.write puts BOTH plain text and HTML on the clipboard

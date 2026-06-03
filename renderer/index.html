@@ -667,24 +667,23 @@ function isImageAttachment(att) {
 // Used for both Forward and Copy. Attachment-only lines (Chat::Lines::Upload)
 // have content==null and a populated attachments[].
 //
-// opts.inlineImages — when true (Copy), image attachments are rendered as a
-// direct <img src="<preview-url>"> using the original Basecamp preview URL.
-// When pasted into another Basecamp doc/comment, the user's browser session
-// (logged into Basecamp) fetches the image directly. Non-image attachments
-// stay as filename links. Forward leaves this off — chat lines don't render
-// arbitrary <img> tags.
+// opts.dataUriImages — when true (Copy), images with a pre-fetched _dataUri
+// are emitted as <img src="data:image/...;base64,..."> so the binary is
+// embedded directly in the HTML — no external URL for Basecamp's paste
+// sanitizer to strip. A filename link is emitted below the image as a
+// caption / fallback (so even if Basecamp ALSO strips data: URIs, the user
+// still has a clickable link to the original). Non-image attachments
+// remain filename links. Forward leaves this off.
 function lineBodyHtml(line, opts) {
-  const inlineImages = !!(opts && opts.inlineImages);
+  const dataUriImages = !!(opts && opts.dataUriImages);
   const parts = [];
   if (line.content) parts.push(cleanForwardHtml(line.content));
   for (const a of (line.attachments || [])) {
     const label = esc(attachmentLabel(a));
     const href = attachmentHref(line, a);
-    if (inlineImages && isImageAttachment(a) && a.url) {
-      // <img> with the original preview URL. The link stays below as a
-      // caption / fallback in case the renderer doesn't show the image.
+    if (dataUriImages && isImageAttachment(a) && a._dataUri) {
       parts.push(
-        `<div><img src="${esc(a.url)}" alt="${label}" style="max-width:640px;height:auto;display:block;"></div>` +
+        `<div><img src="${a._dataUri}" alt="${label}" style="max-width:640px;height:auto;display:block;"></div>` +
         (href ? `<div>📎 <a href="${esc(href)}">${label}</a></div>` : '')
       );
     } else {
@@ -833,12 +832,36 @@ async function runCopy() {
   if (fwdSending || !fwdLines.length) return;
   fwdSending = true;
 
-  // Images use the original Basecamp preview URL directly (<img src="...">).
-  // When the user pastes into another Basecamp surface, their logged-in
-  // browser session fetches the image from preview.app.basecamp.com itself,
-  // so no re-upload / sgid minting is needed. Non-image attachments are kept
-  // as filename links because there's no inline equivalent for them.
-  const html = composeForwardHtml(fwdLines, { inlineImages: true });
+  // Pre-fetch each image attachment as a data: URI so the binary lives
+  // directly in the clipboard HTML — no external URL for Basecamp's paste
+  // sanitizer to strip. (External <img src="https://preview.app.basecamp..."
+  // is stripped on paste, even though the URL is from a Basecamp host.)
+  const MAX_BYTES = 5 * 1024 * 1024;
+  const imgs = [];
+  for (const l of fwdLines) {
+    for (const a of (l.attachments || [])) {
+      if (isImageAttachment(a) && a.download_url) imgs.push(a);
+    }
+  }
+  if (imgs.length) {
+    setFwdStatus(`Downloading ${imgs.length} image${imgs.length === 1 ? '' : 's'}…`);
+    let done = 0, i = 0;
+    const CONCURRENCY = 4;
+    async function worker() {
+      while (i < imgs.length) {
+        const a = imgs[i++];
+        try {
+          const fr = await bp.fetchAttachmentDataUri(a.download_url, MAX_BYTES);
+          if (fr && fr.ok) a._dataUri = `data:${fr.mime};base64,${fr.base64}`;
+        } catch (e) { /* fall through to link */ }
+        done++;
+        setFwdStatus(`Downloading ${done}/${imgs.length} image${imgs.length === 1 ? '' : 's'}…`);
+      }
+    }
+    await Promise.all(Array.from({ length: CONCURRENCY }, worker));
+  }
+
+  const html = composeForwardHtml(fwdLines, { dataUriImages: true });
   const text = composeCopyText(fwdLines);
   setFwdStatus('Writing to clipboard…');
   let cw;
