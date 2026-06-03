@@ -15,4 +15,6 @@ contextBridge.exposeInMainWorld('bping', {
   isFocused: () => ipcRenderer.invoke('app:focused'),
   onFocusChanged: (cb) => ipcRenderer.on('focus-changed', (_e, focused) => cb(!!focused)),
   onMessageSent: (cb) => ipcRenderer.on('message-sent', () => cb()),
+  listPeople: () => ipcRenderer.invoke('people:list'),
+  sendLine: (bucket, chat, html) => ipcRenderer.invoke('api:send-line', { bucket, chat, html }),
 });

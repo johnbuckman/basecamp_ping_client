@@ -56,6 +56,30 @@
            font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; }
   .empty { padding: 22px 14px; color: var(--muted); }
 
+  /* Forward dialog overlay */
+  .fwd-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.45); display: none;
+                 align-items: center; justify-content: center; z-index: 1000; }
+  .fwd-overlay.show { display: flex; }
+  .fwd-card { background: #fff; border-radius: 12px; width: 460px; max-width: 92vw;
+              max-height: 80vh; display: flex; flex-direction: column;
+              box-shadow: 0 12px 40px rgba(0,0,0,.25); overflow: hidden; }
+  .fwd-card > header { display: flex; align-items: center; justify-content: space-between;
+                       padding: 14px 18px 8px; }
+  .fwd-card > header h2 { margin: 0; font-size: 16px; font-weight: 700; }
+  .fwd-x { border: 0; background: transparent; font-size: 22px; cursor: pointer;
+           color: var(--muted); line-height: 1; padding: 0 4px; }
+  .fwd-card input { margin: 6px 18px 8px; padding: 9px 11px; border: 1px solid var(--line);
+                    border-radius: 8px; font: inherit; }
+  .fwd-card input:focus { outline: none; border-color: var(--accent); }
+  .fwd-list { overflow-y: auto; flex: 1; padding: 4px 0; min-height: 200px; }
+  .fwd-item { display: flex; gap: 10px; padding: 8px 18px; cursor: pointer; align-items: center; }
+  .fwd-item:hover { background: #f0efed; }
+  .fwd-item img { width: 32px; height: 32px; border-radius: 50%; object-fit: cover; background: #ddd; }
+  .fwd-item .nm { font-size: 14px; font-weight: 500; }
+  .fwd-item .sub { font-size: 12px; color: var(--muted); margin-top: 1px; }
+  .fwd-empty { padding: 22px 18px; color: var(--muted); font-size: 13px; }
+  .fwd-err { color: #b3261e; padding: 8px 18px 14px; font-size: 13px; min-height: 16px; }
+
   /* Right-click context menu */
   .ctxmenu { position: fixed; min-width: 160px; padding: 4px; background: #fff; border: 1px solid var(--line);
              border-radius: 8px; box-shadow: 0 6px 20px rgba(0,0,0,0.12); z-index: 100; display: none; }
@@ -103,6 +127,19 @@
         <webview id="bc" partition="persist:basecamp" allowpopups src="about:blank"></webview>
         <div id="hint">Click a person on the left to open your real Basecamp ping here<br>(full features: boosts, replies, attachments, read receipts)</div>
       </div>
+    </div>
+  </div>
+
+  <!-- Forward dialog overlay (shown when the user picks Forward in Basecamp's "…" menu) -->
+  <div id="fwdOverlay" class="fwd-overlay" style="display:none">
+    <div class="fwd-card">
+      <header>
+        <h2>Forward to…</h2>
+        <button class="fwd-x" id="fwdClose" title="Cancel (Esc)">×</button>
+      </header>
+      <input id="fwdSearch" type="text" placeholder="Search by name or email — empty = your recent pings" autocomplete="off">
+      <div id="fwdList" class="fwd-list"></div>
+      <div class="fwd-err" id="fwdErr"></div>
     </div>
   </div>
 
@@ -426,11 +463,214 @@ async function signOut() {
 
 // After opening a ping, focus Basecamp's message box (inside the webview) so you can type right away.
 const FOCUS_JS = `(function(){var n=0;function f(){n++;var e=document.querySelector('trix-editor')||document.querySelector('[contenteditable="true"]')||document.querySelector('textarea')||document.querySelector('input[type="text"]');if(e){try{e.focus();}catch(x){}try{var s=window.getSelection(),r=document.createRange();r.selectNodeContents(e);r.collapse(false);s.removeAllRanges();s.addRange(r);}catch(x){}return;}if(n<25){setTimeout(f,150);}}f();})();`;
+
+// Injected on every webview load. Watches Basecamp's chat DOM for the action
+// popover ("…" menu) to appear, then inserts a "Forward" item into it. When the
+// user clicks Forward, the script reads {author, profileUrl, html, text} from
+// the surrounding message and posts it back to the host via console.log with a
+// magic prefix that we capture below. Selectors are best-effort and may need
+// updating if Basecamp restructures the chat UI.
+const FORWARD_INJECT_JS = `(function(){
+  if (window.__bpingForwardInstalled) return;
+  window.__bpingForwardInstalled = true;
+  var POPOVER_SELECTORS = ['.bc-action-menu', '.action-menu-popup', '.popover-menu',
+    '.dropdown-menu', '[role="menu"]', 'menu[role="menu"]'];
+  var MESSAGE_SELECTORS = ['[data-recording-id]', '[data-permanent-id]', '.chat-line',
+    '.message', 'chat-line', '[role="article"]'];
+  function findMessageFor(el) {
+    var cur = el;
+    while (cur && cur !== document.body) {
+      for (var i = 0; i < MESSAGE_SELECTORS.length; i++) {
+        try { if (cur.matches && cur.matches(MESSAGE_SELECTORS[i])) return cur; } catch (e) {}
+      }
+      cur = cur.parentElement;
+    }
+    return null;
+  }
+  function extractInfo(msgEl) {
+    var authorLink = msgEl.querySelector && msgEl.querySelector('a[href*="/people/"], a[href*="/profiles/"]');
+    var authorName = authorLink ? (authorLink.textContent || '').trim() : 'Someone';
+    var profileUrl = authorLink ? authorLink.href : '';
+    var bodyEl = msgEl.querySelector && (
+      msgEl.querySelector('.message-body') ||
+      msgEl.querySelector('.line-content') ||
+      msgEl.querySelector('.rich-text-content') ||
+      msgEl.querySelector('.content') ||
+      msgEl.querySelector('blockquote') ||
+      msgEl
+    ) || msgEl;
+    return { authorName: authorName, profileUrl: profileUrl,
+      html: bodyEl.innerHTML || '', text: (bodyEl.innerText || '').trim() };
+  }
+  function injectInto(popover) {
+    if (popover.querySelector('[data-bping-forward]')) return;
+    var template = popover.querySelector('button, a, [role="menuitem"], li');
+    var item = document.createElement(template && template.tagName === 'A' ? 'a' : 'button');
+    item.dataset.bpingForward = '1';
+    item.setAttribute('role', 'menuitem');
+    item.textContent = 'Forward';
+    if (template) item.className = template.className || '';
+    item.style.cssText = 'display:block;width:100%;text-align:left;padding:6px 12px;border:0;background:transparent;cursor:pointer;font:inherit;color:inherit;';
+    item.addEventListener('click', function(e) {
+      e.stopPropagation(); e.preventDefault();
+      // Strategy: try the popover's anchor, then any aria-expanded=true trigger,
+      // then walk up the popover itself.
+      var anchor = document.querySelector('[aria-expanded="true"]');
+      var msg = (anchor && findMessageFor(anchor)) || findMessageFor(popover) || findMessageFor(popover.parentElement);
+      if (!msg) {
+        console.log('__BPING_FORWARD_DEBUG__no-message-context');
+        return;
+      }
+      var info = extractInfo(msg);
+      console.log('__BPING_FORWARD__' + JSON.stringify(info));
+      try { popover.style.display = 'none'; } catch (x) {}
+      try { document.body.click(); } catch (x) {}
+    }, true);
+    popover.appendChild(item);
+  }
+  function scan(root) {
+    if (!root || root.nodeType !== 1) return;
+    for (var i = 0; i < POPOVER_SELECTORS.length; i++) {
+      try {
+        if (root.matches && root.matches(POPOVER_SELECTORS[i])) injectInto(root);
+        var inner = root.querySelectorAll ? root.querySelectorAll(POPOVER_SELECTORS[i]) : [];
+        for (var j = 0; j < inner.length; j++) injectInto(inner[j]);
+      } catch (e) {}
+    }
+  }
+  var obs = new MutationObserver(function(muts) {
+    for (var i = 0; i < muts.length; i++) {
+      var adds = muts[i].addedNodes;
+      for (var j = 0; j < adds.length; j++) scan(adds[j]);
+    }
+  });
+  obs.observe(document.body, { childList: true, subtree: true });
+  scan(document.body);
+})();`;
+
 frame.addEventListener('did-finish-load', () => {
+  // Always re-install the Forward menu hook (Basecamp's Turbo navs can wipe it).
+  frame.executeJavaScript(FORWARD_INJECT_JS).catch(() => {});
+  // Focus the composer once when we just opened a ping.
   if (!focusComposer) return;
   focusComposer = false;
   try { frame.focus(); } catch (e) {}
   frame.executeJavaScript(FOCUS_JS).catch(() => {});
+});
+
+// Capture the Forward click from the injected script (console.log magic prefix).
+frame.addEventListener('console-message', (e) => {
+  const msg = e && e.message ? String(e.message) : '';
+  if (!msg.startsWith('__BPING_FORWARD__')) return;
+  try {
+    const payload = JSON.parse(msg.slice('__BPING_FORWARD__'.length));
+    openForwardDialog(payload);
+  } catch (err) { /* malformed payload — ignore */ }
+});
+
+// ---- Forward dialog ----
+const fwdOverlay = $('#fwdOverlay');
+const fwdSearch  = $('#fwdSearch');
+const fwdList    = $('#fwdList');
+const fwdErr     = $('#fwdErr');
+let fwdCtx = null;          // { authorName, profileUrl, html, text }
+let allPeople = null;       // cached account roster (lazy, on first dialog open)
+
+function openForwardDialog(ctx) {
+  fwdCtx = ctx || {};
+  fwdSearch.value = '';
+  fwdErr.textContent = '';
+  fwdList.scrollTop = 0;
+  fwdOverlay.classList.add('show');
+  renderFwdList('');
+  setTimeout(() => fwdSearch.focus(), 50);
+  // Lazily prefetch the full pingable-people roster in the background so the
+  // typeahead has data once the user starts typing.
+  if (!allPeople) {
+    bp.listPeople().then(r => {
+      allPeople = Array.isArray(r) ? r : [];
+      if (fwdOverlay.classList.contains('show') && fwdSearch.value) renderFwdList(fwdSearch.value);
+    }).catch(() => { allPeople = []; });
+  }
+}
+function closeForwardDialog() { fwdOverlay.classList.remove('show'); fwdCtx = null; }
+
+function renderFwdList(query) {
+  fwdList.innerHTML = '';
+  const q = (query || '').trim().toLowerCase();
+  let items;
+  if (!q) {
+    // Default: recent contacts from the left pane.
+    items = peopleData.map(p => ({
+      id: null, name: p.name, avatar: p.avatar, email: '',
+      bucket: p.bucket, chat: p.chat, hasPing: true,
+    }));
+  } else {
+    const roster = allPeople || [];
+    const matches = roster.filter(p =>
+      (p.name && p.name.toLowerCase().includes(q)) ||
+      (p.email && p.email.toLowerCase().includes(q))
+    ).slice(0, 40);
+    items = matches.map(p => {
+      // Cross-reference with peopleData to know if there's an existing ping.
+      const existing = peopleData.find(d => d.name === p.name);
+      return {
+        id: p.id, name: p.name, avatar: p.avatar, email: p.email,
+        bucket: existing ? existing.bucket : null,
+        chat:   existing ? existing.chat   : null,
+        hasPing: !!existing,
+      };
+    });
+    if (!matches.length && !allPeople) {
+      fwdList.innerHTML = '<div class="fwd-empty">Loading account directory…</div>';
+      return;
+    }
+  }
+  if (!items.length) {
+    fwdList.innerHTML = '<div class="fwd-empty">No matches.</div>';
+    return;
+  }
+  items.forEach(p => {
+    const row = document.createElement('div');
+    row.className = 'fwd-item';
+    row.innerHTML = `
+      <img src="${esc(p.avatar || '')}" alt="">
+      <div>
+        <div class="nm"></div>
+        <div class="sub">${p.hasPing ? 'Existing ping' : 'No ping yet — open their profile to start one'}</div>
+      </div>`;
+    row.querySelector('.nm').textContent = p.name;
+    row.onclick = () => sendForward(p);
+    fwdList.appendChild(row);
+  });
+}
+
+async function sendForward(recipient) {
+  if (!fwdCtx) return;
+  if (!recipient.hasPing) {
+    fwdErr.textContent = 'No existing ping with ' + recipient.name + '. Click their name in Basecamp to start one, then try Forward again.';
+    return;
+  }
+  const author = fwdCtx.authorName || 'Someone';
+  const profileUrl = fwdCtx.profileUrl || '';
+  const body = (fwdCtx.html && fwdCtx.html.trim()) ? fwdCtx.html : ('<div>' + esc(fwdCtx.text || '') + '</div>');
+  const html =
+    '<div><a href="' + esc(profileUrl) + '">' + esc(author) + ' wrote:</a></div>' +
+    '<div>' + body + '</div>';
+  fwdErr.textContent = 'Sending…';
+  const r = await bp.sendLine(recipient.bucket, recipient.chat, html);
+  if (r && r.error) { fwdErr.textContent = 'Send failed: ' + r.error; return; }
+  // Open the destination in the right pane and close the dialog.
+  const dest = peopleData.find(p => String(p.bucket) === String(recipient.bucket) && String(p.chat) === String(recipient.chat));
+  closeForwardDialog();
+  if (dest) openConvo(dest);
+}
+
+$('#fwdClose').onclick = closeForwardDialog;
+fwdOverlay.addEventListener('click', (e) => { if (e.target === fwdOverlay) closeForwardDialog(); });
+fwdSearch.addEventListener('input', () => renderFwdList(fwdSearch.value));
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && fwdOverlay.classList.contains('show')) closeForwardDialog();
 });
 
 function setPoll(ms) { if (peopleTimer) clearInterval(peopleTimer); peopleTimer = setInterval(loadPeople, ms); }
