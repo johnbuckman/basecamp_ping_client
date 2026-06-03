@@ -639,14 +639,38 @@ function cleanForwardHtml(html) {
     .replace(/<p(\s[^>]*)?>/gi, '<div>')
     .replace(/<\/p>/gi, '</div>');
 }
-function fwdBlockFor(line) {
-  const c = line.creator || {};
+// HTML "Name wrote:" lead line. The author's profile is linked so the
+// recipient can click through to ping them directly.
+function fwdHeaderHtml(creator) {
+  const c = creator || {};
   const url = c.profile_url || '';
   const safeName = esc(c.name || 'Someone');
-  const lead = url
+  return url
     ? `<div><a href="${esc(url)}">${safeName} wrote:</a></div>`
     : `<div><strong>${safeName} wrote:</strong></div>`;
-  return lead + `<div>${cleanForwardHtml(line.content)}</div>`;
+}
+
+// Compose the rich-text forward/copy payload.
+//   - Consecutive comments by the same author share ONE "Name wrote:" header.
+//   - Each comment body is wrapped in <blockquote> (Basecamp's chat HTML
+//     allows it; renders indented in Mail/Notes/Basecamp).
+//   - Blocks (header+blockquote or bare blockquote when the author repeats)
+//     are joined by <div><br></div> to put a blank line between each
+//     forwarded comment.
+function composeForwardHtml(lines) {
+  const blocks = [];
+  let lastCreatorId = null;
+  for (const l of lines) {
+    const c = l.creator || {};
+    let block = '';
+    if (c.id !== lastCreatorId) {
+      block += fwdHeaderHtml(c);
+      lastCreatorId = c.id;
+    }
+    block += `<blockquote>${cleanForwardHtml(l.content)}</blockquote>`;
+    blocks.push(block);
+  }
+  return blocks.join('<div><br></div>');
 }
 
 async function sendForward(recipient) {
@@ -654,8 +678,10 @@ async function sendForward(recipient) {
   fwdSending = true;
   fwdSearch.disabled = true;
   setFwdStatus(`Forwarding ${fwdLines.length} message${fwdLines.length === 1 ? '' : 's'} to ${recipient.name}…`);
-  // Compose one rich-text chat line that contains every bookmarked comment.
-  const html = fwdLines.map(fwdBlockFor).join('<div><br></div>');
+  // Compose one rich-text chat line containing every bookmarked comment,
+  // with consecutive same-author runs grouped under one "wrote:" header
+  // and each body wrapped in <blockquote>.
+  const html = composeForwardHtml(fwdLines);
   let res;
   try { res = await bp.sendLine(recipient.bucket, recipient.chat, html); }
   catch (e) { setFwdStatus('Forward failed: ' + e.message); fwdSearch.disabled = false; fwdSending = false; return; }
@@ -687,30 +713,58 @@ async function sendForward(recipient) {
 function htmlToText(html) {
   if (!html) return '';
   // Map block-level closers to newlines BEFORE stripping tags so paragraphs
-  // and divs render as actual line breaks in plain text.
+  // and divs render as actual line breaks in plain text. Paragraphs (<p>),
+  // blockquotes, and headings are "real" block separators → BLANK LINE
+  // between them (\n\n). Divs and list items are single line breaks (\n).
+  // This was the bug behind #4: <p>p1</p><p>p2</p> was collapsing to
+  // "p1\np2" because </p> mapped to a single \n.
   const prepped = String(html)
     .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<\/(p|div|li|blockquote|h\d)>/gi, '\n')
+    .replace(/<\/(p|blockquote|h[1-6])>/gi, '\n\n')
+    .replace(/<\/(div|li)>/gi, '\n')
     .replace(/<bc-attachment[\s\S]*?<\/bc-attachment>/gi, '[attachment]');
   const tmp = document.createElement('div');
   tmp.innerHTML = prepped;
   return (tmp.textContent || '').replace(/\n{3,}/g, '\n\n').trim();
 }
-function copyBlockText(line) {
-  const c = line.creator || {};
-  const name = c.name || 'Someone';
-  const url  = c.profile_url || '';
-  const head = url ? `${name} wrote: (${url})` : `${name} wrote:`;
-  const body = htmlToText(line.content);
-  return head + (body ? '\n' + body : '');
+
+// Mail-style ">" quote prefix on every line, including blank lines (so the
+// reader can see at-a-glance that the entire passage is quoted).
+function quotePlain(text) {
+  if (!text) return '';
+  return text.split('\n').map(line => line ? '> ' + line : '>').join('\n');
+}
+
+// Compose the plain-text copy payload — mirrors composeForwardHtml:
+//   - Consecutive comments by the same author share one "Name wrote:" header.
+//   - Each comment body is quote-prefixed.
+//   - Blocks are joined by a blank line (\n\n).
+function composeCopyText(lines) {
+  const blocks = [];
+  let lastCreatorId = null;
+  for (const l of lines) {
+    const c = l.creator || {};
+    let block = '';
+    if (c.id !== lastCreatorId) {
+      const name = c.name || 'Someone';
+      const url  = c.profile_url || '';
+      block += (url ? `${name} wrote: (${url})` : `${name} wrote:`) + '\n';
+      lastCreatorId = c.id;
+    }
+    block += quotePlain(htmlToText(l.content));
+    blocks.push(block);
+  }
+  return blocks.join('\n\n');
 }
 
 async function runCopy() {
   if (fwdSending || !fwdLines.length) return;
   fwdSending = true;
-  // Compose rich-text (same shape as forward) and plain-text versions.
-  const html = fwdLines.map(fwdBlockFor).join('<div><br></div>');
-  const text = fwdLines.map(copyBlockText).join('\n\n');
+  // Compose rich-text (same shape as forward) and plain-text versions —
+  // both group consecutive same-author comments under one header and quote
+  // each body so the reader sees at a glance what was lifted.
+  const html = composeForwardHtml(fwdLines);
+  const text = composeCopyText(fwdLines);
   let cw;
   try { cw = await bp.writeClipboard(text, html); }
   catch (e) { setFwdStatus('Copy failed: ' + e.message); fwdSending = false; return; }
