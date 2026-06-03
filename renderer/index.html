@@ -473,10 +473,35 @@ const FOCUS_JS = `(function(){var n=0;function f(){n++;var e=document.querySelec
 const FORWARD_INJECT_JS = `(function(){
   if (window.__bpingForwardInstalled) return;
   window.__bpingForwardInstalled = true;
-  var POPOVER_SELECTORS = ['.bc-action-menu', '.action-menu-popup', '.popover-menu',
-    '.dropdown-menu', '[role="menu"]', 'menu[role="menu"]'];
-  var MESSAGE_SELECTORS = ['[data-recording-id]', '[data-permanent-id]', '.chat-line',
-    '.message', 'chat-line', '[role="article"]'];
+  function lg(){ try { console.log('__BPING_FWD_LOG__' + Array.prototype.slice.call(arguments).map(String).join(' ')); } catch(e){} }
+  var MENU_HINTS = ['menu','popup','popover','dropdown','action','options','overflow'];
+  var TRIGGER_HINTS = ['action','option','more','overflow','menu'];
+  var MESSAGE_SELECTORS = [
+    '[data-recording-id]', '[data-permanent-id]', '[data-recording]',
+    '[data-line-id]', '[data-comment-id]',
+    '[id^="recording_"]', '[id^="chat_line_"]', '[id^="line_"]', '[id^="comment_"]',
+    '.chat-line', '.message', 'chat-line', 'bc-chat-line',
+    '[role="article"]', '[role="listitem"]'
+  ];
+  var pendingTrigger = null;
+
+  function looksLikeMenu(el) {
+    if (!el || el.nodeType !== 1 || !el.querySelector) return false;
+    var role = el.getAttribute && el.getAttribute('role');
+    if (role === 'menu' || role === 'listbox') return true;
+    var cls = (typeof el.className === 'string') ? el.className : '';
+    var hay = (cls + ' ' + (el.id||'') + ' ' + (el.tagName||'')).toLowerCase();
+    for (var i = 0; i < MENU_HINTS.length; i++) { if (hay.indexOf(MENU_HINTS[i]) !== -1) return true; }
+    // Heuristic: contains 2–12 stacked menu-item-ish children
+    var items = el.querySelectorAll('[role="menuitem"], button, a');
+    if (items.length >= 2 && items.length <= 12) {
+      var visible = 0;
+      for (var j = 0; j < items.length; j++) { if (items[j].offsetParent !== null) visible++; }
+      if (visible >= 2) return true;
+    }
+    return false;
+  }
+
   function findMessageFor(el) {
     var cur = el;
     while (cur && cur !== document.body) {
@@ -487,65 +512,108 @@ const FORWARD_INJECT_JS = `(function(){
     }
     return null;
   }
+
   function extractInfo(msgEl) {
-    var authorLink = msgEl.querySelector && msgEl.querySelector('a[href*="/people/"], a[href*="/profiles/"]');
+    var authorLink = msgEl.querySelector && msgEl.querySelector('a[href*="/people/"], a[href*="/profiles/"], a[href*="/users/"]');
     var authorName = authorLink ? (authorLink.textContent || '').trim() : 'Someone';
     var profileUrl = authorLink ? authorLink.href : '';
-    var bodyEl = msgEl.querySelector && (
+    var bodyEl = (msgEl.querySelector && (
       msgEl.querySelector('.message-body') ||
       msgEl.querySelector('.line-content') ||
       msgEl.querySelector('.rich-text-content') ||
-      msgEl.querySelector('.content') ||
-      msgEl.querySelector('blockquote') ||
-      msgEl
-    ) || msgEl;
+      msgEl.querySelector('[class*="body"]') ||
+      msgEl.querySelector('[class*="content"]')
+    )) || msgEl;
     return { authorName: authorName, profileUrl: profileUrl,
       html: bodyEl.innerHTML || '', text: (bodyEl.innerText || '').trim() };
   }
+
   function injectInto(popover) {
+    if (!popover || !popover.appendChild) return;
     if (popover.querySelector('[data-bping-forward]')) return;
     var template = popover.querySelector('button, a, [role="menuitem"], li');
-    var item = document.createElement(template && template.tagName === 'A' ? 'a' : 'button');
+    var tag = (template && template.tagName === 'A') ? 'a' : 'button';
+    var item = document.createElement(tag);
     item.dataset.bpingForward = '1';
     item.setAttribute('role', 'menuitem');
+    if (tag === 'a') item.setAttribute('href', '#');
     item.textContent = 'Forward';
-    if (template) item.className = template.className || '';
-    item.style.cssText = 'display:block;width:100%;text-align:left;padding:6px 12px;border:0;background:transparent;cursor:pointer;font:inherit;color:inherit;';
+    if (template && typeof template.className === 'string') item.className = template.className;
+    item.style.cssText = 'display:block;width:100%;text-align:left;padding:8px 14px;border:0;background:transparent;cursor:pointer;font:inherit;color:inherit;text-decoration:none;';
+    item.addEventListener('mouseenter', function(){ item.style.background = 'rgba(0,0,0,.06)'; });
+    item.addEventListener('mouseleave', function(){ item.style.background = 'transparent'; });
     item.addEventListener('click', function(e) {
       e.stopPropagation(); e.preventDefault();
-      // Strategy: try the popover's anchor, then any aria-expanded=true trigger,
-      // then walk up the popover itself.
-      var anchor = document.querySelector('[aria-expanded="true"]');
-      var msg = (anchor && findMessageFor(anchor)) || findMessageFor(popover) || findMessageFor(popover.parentElement);
-      if (!msg) {
-        console.log('__BPING_FORWARD_DEBUG__no-message-context');
-        return;
-      }
+      var msg = (pendingTrigger && findMessageFor(pendingTrigger))
+             || findMessageFor(document.querySelector('[aria-expanded="true"]'))
+             || findMessageFor(popover)
+             || findMessageFor(popover.parentElement);
+      if (!msg) { lg('forward-click: no message context', popover.tagName, 'pending='+!!pendingTrigger); return; }
       var info = extractInfo(msg);
       console.log('__BPING_FORWARD__' + JSON.stringify(info));
       try { popover.style.display = 'none'; } catch (x) {}
       try { document.body.click(); } catch (x) {}
     }, true);
     popover.appendChild(item);
+    var cls = (typeof popover.className === 'string') ? popover.className.slice(0,60) : '';
+    lg('injected Forward into', popover.tagName + (popover.id ? '#'+popover.id : '') + (cls ? '.'+cls : ''));
   }
+
   function scan(root) {
     if (!root || root.nodeType !== 1) return;
-    for (var i = 0; i < POPOVER_SELECTORS.length; i++) {
-      try {
-        if (root.matches && root.matches(POPOVER_SELECTORS[i])) injectInto(root);
-        var inner = root.querySelectorAll ? root.querySelectorAll(POPOVER_SELECTORS[i]) : [];
-        for (var j = 0; j < inner.length; j++) injectInto(inner[j]);
-      } catch (e) {}
+    if (looksLikeMenu(root)) injectInto(root);
+    var all = root.querySelectorAll ? root.querySelectorAll('*') : [];
+    for (var i = 0; i < all.length; i++) {
+      if (looksLikeMenu(all[i])) injectInto(all[i]);
     }
   }
-  var obs = new MutationObserver(function(muts) {
+
+  // Strategy 1: capture click on a "…"-looking button → remember the message.
+  document.addEventListener('click', function(e) {
+    var btn = e.target && e.target.closest && e.target.closest('button, a, [role="button"]');
+    if (!btn) return;
+    var label = ((btn.getAttribute && (btn.getAttribute('aria-label') || btn.getAttribute('title'))) || '').toLowerCase();
+    var txt = (btn.textContent || '').trim();
+    var hit = false;
+    for (var i = 0; i < TRIGGER_HINTS.length; i++) { if (label.indexOf(TRIGGER_HINTS[i]) !== -1) { hit = true; break; } }
+    if (!hit && (txt === '…' || txt === '...' || txt === '•••' || txt === '⋯' || txt === '⋮')) hit = true;
+    if (hit) {
+      pendingTrigger = btn;
+      lg('trigger captured:', btn.tagName, 'label='+label, 'txt="'+txt.slice(0,20)+'"');
+      setTimeout(function(){ scan(document.body); }, 0);
+      setTimeout(function(){ scan(document.body); }, 80);
+      setTimeout(function(){ scan(document.body); }, 250);
+    }
+  }, true);
+
+  // Strategy 2: aria-expanded → true on any button → scan aria-controls target.
+  var attrObs = new MutationObserver(function(muts) {
+    for (var i = 0; i < muts.length; i++) {
+      var t = muts[i].target;
+      if (muts[i].attributeName !== 'aria-expanded') continue;
+      if (!t.getAttribute || t.getAttribute('aria-expanded') !== 'true') continue;
+      pendingTrigger = t;
+      var ctlId = t.getAttribute('aria-controls');
+      if (ctlId) {
+        var pop = document.getElementById(ctlId);
+        if (pop) { lg('aria-expanded→', ctlId, pop.tagName); setTimeout(function(){ injectInto(pop); scan(pop); }, 0); }
+      }
+      setTimeout(function(){ scan(document.body); }, 0);
+    }
+  });
+  attrObs.observe(document.body, { attributes: true, subtree: true, attributeFilter: ['aria-expanded'] });
+
+  // Strategy 3: any newly-inserted subtree → scan it.
+  var addObs = new MutationObserver(function(muts) {
     for (var i = 0; i < muts.length; i++) {
       var adds = muts[i].addedNodes;
       for (var j = 0; j < adds.length; j++) scan(adds[j]);
     }
   });
-  obs.observe(document.body, { childList: true, subtree: true });
+  addObs.observe(document.body, { childList: true, subtree: true });
+
   scan(document.body);
+  lg('FORWARD_INJECT_JS installed');
 })();`;
 
 frame.addEventListener('did-finish-load', () => {
@@ -558,14 +626,29 @@ frame.addEventListener('did-finish-load', () => {
   frame.executeJavaScript(FOCUS_JS).catch(() => {});
 });
 
-// Capture the Forward click from the injected script (console.log magic prefix).
+// Capture messages from the injected script:
+//   __BPING_FORWARD__<json>  → open the Forward dialog with that payload.
+//   __BPING_FWD_LOG__<text>  → re-log as [bping/inject] so we can see what the
+//     injection sees (open the renderer's DevTools with ⌘⌥I to view).
 frame.addEventListener('console-message', (e) => {
   const msg = e && e.message ? String(e.message) : '';
-  if (!msg.startsWith('__BPING_FORWARD__')) return;
-  try {
-    const payload = JSON.parse(msg.slice('__BPING_FORWARD__'.length));
-    openForwardDialog(payload);
-  } catch (err) { /* malformed payload — ignore */ }
+  if (msg.startsWith('__BPING_FORWARD__')) {
+    try {
+      const payload = JSON.parse(msg.slice('__BPING_FORWARD__'.length));
+      openForwardDialog(payload);
+    } catch (err) { /* malformed payload — ignore */ }
+  } else if (msg.startsWith('__BPING_FWD_LOG__')) {
+    console.log('[bping/inject]', msg.slice('__BPING_FWD_LOG__'.length));
+  }
+});
+
+// ⌘⌥⇧I — open the chat <webview>'s DevTools so you can inspect Basecamp's
+// real DOM and copy the "..." popover selector if our heuristics miss it.
+document.addEventListener('keydown', (e) => {
+  if (e.metaKey && e.altKey && e.shiftKey && (e.key === 'I' || e.key === 'i')) {
+    e.preventDefault();
+    try { frame.openDevTools({ mode: 'detach' }); } catch (er) {}
+  }
 });
 
 // ---- Forward dialog ----

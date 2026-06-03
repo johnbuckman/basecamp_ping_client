@@ -1,6 +1,6 @@
 {
   "name": "bping",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Basecamp Pings — native wrapper that embeds the real Basecamp chat",
   "main": "main.js",
   "scripts": {
