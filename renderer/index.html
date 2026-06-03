@@ -639,6 +639,54 @@ function cleanForwardHtml(html) {
     .replace(/<p(\s[^>]*)?>/gi, '<div>')
     .replace(/<\/p>/gi, '</div>');
 }
+// Human-readable byte size: "37 KB", "1.2 MB", etc.
+function humanSize(n) {
+  if (!n || n < 0) return '';
+  if (n >= 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + ' MB';
+  if (n >= 1024) return Math.round(n / 1024) + ' KB';
+  return n + ' B';
+}
+function attachmentLabel(att) {
+  const name = att.filename || att.title || 'attachment';
+  const detail = [att.content_type, humanSize(att.byte_size)].filter(Boolean).join(', ');
+  return detail ? `${name} (${detail})` : name;
+}
+// Best clickable link for the attachment: the line's app_url opens the chat
+// line in Basecamp's web app, where the recipient (who has a Basecamp login)
+// sees the attachment inline. The attachment's preview/download URLs require
+// session cookies, so they don't render cleanly elsewhere.
+function attachmentHref(line, att) {
+  return line.app_url || att.url || att.download_url || '';
+}
+
+// HTML body of a single line — text content, attachments, or both.
+// Used for both Forward and Copy. Attachment-only lines (Chat::Lines::Upload)
+// have content==null and a populated attachments[]; render each attachment
+// as a clickable filename so the recipient can view the original.
+function lineBodyHtml(line) {
+  const parts = [];
+  if (line.content) parts.push(cleanForwardHtml(line.content));
+  for (const a of (line.attachments || [])) {
+    const label = esc(attachmentLabel(a));
+    const href = attachmentHref(line, a);
+    parts.push(href
+      ? `<div>📎 <a href="${esc(href)}">${label}</a></div>`
+      : `<div>📎 ${label}</div>`);
+  }
+  return parts.join('');
+}
+// Plain-text body, symmetric with lineBodyHtml.
+function lineBodyText(line) {
+  const parts = [];
+  if (line.content) parts.push(htmlToText(line.content));
+  for (const a of (line.attachments || [])) {
+    const label = attachmentLabel(a);
+    const href = attachmentHref(line, a);
+    parts.push(href ? `📎 ${label} — ${href}` : `📎 ${label}`);
+  }
+  return parts.join('\n\n');
+}
+
 // HTML "Name wrote:" lead line. The author's profile is linked so the
 // recipient can click through to ping them directly.
 function fwdHeaderHtml(creator) {
@@ -662,12 +710,14 @@ function composeForwardHtml(lines) {
   let lastCreatorId = null;
   for (const l of lines) {
     const c = l.creator || {};
+    const body = lineBodyHtml(l);
+    if (!body) continue;   // genuinely-empty line — defensive, shouldn't happen
     let block = '';
     if (c.id !== lastCreatorId) {
       block += fwdHeaderHtml(c);
       lastCreatorId = c.id;
     }
-    block += `<blockquote>${cleanForwardHtml(l.content)}</blockquote>`;
+    block += `<blockquote>${body}</blockquote>`;
     blocks.push(block);
   }
   return blocks.join('<div><br></div>');
@@ -744,6 +794,8 @@ function composeCopyText(lines) {
   let lastCreatorId = null;
   for (const l of lines) {
     const c = l.creator || {};
+    const body = lineBodyText(l);
+    if (!body) continue;   // defensive
     let block = '';
     if (c.id !== lastCreatorId) {
       const name = c.name || 'Someone';
@@ -751,7 +803,7 @@ function composeCopyText(lines) {
       block += (url ? `${name} wrote: (${url})` : `${name} wrote:`) + '\n';
       lastCreatorId = c.id;
     }
-    block += quotePlain(htmlToText(l.content));
+    block += quotePlain(body);
     blocks.push(block);
   }
   return blocks.join('\n\n');
