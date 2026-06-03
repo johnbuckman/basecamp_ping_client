@@ -177,37 +177,72 @@ async function bearerSend(absUrl, method, body) {
 const apiSend = (p, method, body) => bearerSend(`${API_ROOT}/${config.accountId}${p}`, method, body);
 
 // --- Bookmarks / forward helpers ----------------------------------------
-// GET /my/bookmarks.json returns null when empty; treat as empty list.
-async function fetchBookmarks() {
-  const r = await apiSend('/my/bookmarks.json', 'GET');
-  if (!r.ok) throw new Error('bookmarks HTTP ' + r.status);
-  const txt = await r.text();
-  if (!txt || txt.trim() === 'null') return [];
-  try { const j = JSON.parse(txt); return Array.isArray(j) ? j : []; }
-  catch (e) { return []; }
+// Basecamp's OAuth API DOES NOT expose `/my/bookmarks.json` (returns null even
+// when the user has bookmarks made via the web UI). But every recording carries
+// a per-recording `bookmark_url` of the form
+// `/my/bookmarks/<signed-token>.json` which returns `{"bookmarked": true|false}`
+// for the calling user. DELETE on that same URL removes the bookmark. We
+// discover the user's bookmarks by scanning the chat's recent lines and
+// inspecting each line's bookmark_url.
+//
+// Trade-off: there's no `bookmarked_at` timestamp anywhere, so we can't filter
+// by "bookmarked in the past 30 minutes" as originally spec'd. We surface ALL
+// currently-bookmarked lines in the chat — the auto-DELETE after a successful
+// forward keeps stale bookmarks from accumulating.
+async function fetchChatBookmarks(bucket, chat) {
+  // Scan the chat's recent lines (up to ~4 pages = newest ~100-150 lines).
+  // /lines.json doesn't honor per_page; we just walk pages 1..N.
+  const PAGES = 4;
+  const byId = new Map();
+  for (let page = 1; page <= PAGES; page++) {
+    let lines;
+    try {
+      lines = await api(`/buckets/${bucket}/chats/${chat}/lines.json` + (page > 1 ? `?page=${page}` : ''));
+    } catch (e) { break; }
+    if (!Array.isArray(lines) || !lines.length) break;
+    for (const l of lines) if (!byId.has(l.id)) byId.set(l.id, l);
+    if (lines.length < 10) break;
+  }
+  const lines = [...byId.values()];
+
+  // Probe each line's bookmark_url in parallel (concurrency capped to stay
+  // well under Basecamp's 50 req / 10 s rate limit).
+  const CONCURRENCY = 8;
+  const bookmarked = [];
+  let i = 0;
+  async function worker() {
+    while (i < lines.length) {
+      const l = lines[i++];
+      if (!l || !l.bookmark_url) continue;
+      try {
+        const r = await bearerSend(l.bookmark_url, 'GET');
+        if (!r.ok) continue;
+        const j = await r.json();
+        if (j && j.bookmarked === true) bookmarked.push(l);
+      } catch (e) { /* skip on transient error */ }
+    }
+  }
+  await Promise.all(Array.from({ length: CONCURRENCY }, worker));
+
+  // Annotate creator with profile URL the forwarded-message recipient can click
+  // to start a ping with the original author.
+  const base = (config.appHref || `https://3.basecamp.com/${config.accountId}`).replace(/\/$/, '');
+  for (const l of bookmarked) {
+    const c = l.creator;
+    if (c && c.id) c.profile_url = `${base}/people/${c.id}`;
+  }
+  // Oldest-first so the forwarded thread reads chronologically.
+  bookmarked.sort((a, b) => Date.parse(a.created_at || 0) - Date.parse(b.created_at || 0));
+  return bookmarked;
 }
 
-// Bookmark delete: Basecamp doesn't document which URL shape is the right one
-// for OAuth (the web-UI uses session cookies, and every shape I tried returns
-// 404). Try the plausible ones — return true on any 2xx.
-async function tryDeleteBookmark(bm) {
-  const recId = bm && bm.recording && bm.recording.id;
-  const bucketId = bm && bm.recording && bm.recording.bucket && bm.recording.bucket.id;
-  const bmId = bm && bm.id;
-  const paths = [];
-  if (bmId) paths.push(`/my/bookmarks/${bmId}.json`);
-  if (recId && recId !== bmId) paths.push(`/my/bookmarks/${recId}.json`);
-  if (bucketId && recId) {
-    paths.push(`/buckets/${bucketId}/recordings/${recId}/bookmark.json`);
-    paths.push(`/buckets/${bucketId}/recordings/${recId}/bookmarks.json`);
-  }
-  for (const p of paths) {
-    try {
-      const r = await apiSend(p, 'DELETE');
-      if (r.ok || r.status === 204) return true;
-    } catch (e) { /* try the next shape */ }
-  }
-  return false;
+// DELETE the bookmark via the line's bookmark_url (verified to work; returns 204).
+async function unbookmarkUrl(bookmarkUrl) {
+  if (!bookmarkUrl || !/^https:\/\/[^/]+\.basecampapi\.com\//.test(bookmarkUrl)) return false;
+  try {
+    const r = await bearerSend(bookmarkUrl, 'DELETE');
+    return r.ok || r.status === 204;
+  } catch (e) { return false; }
 }
 
 async function sendChatLine(bucket, chat, html) {
@@ -382,22 +417,18 @@ ipcMain.handle('open-external', (_e, url) => { if (/^https?:\/\//.test(url || ''
 ipcMain.handle('app:focused', () => !!(mainWin && mainWin.isFocused()));
 
 // --- Forward feature IPC ----------------------------------------------------
-ipcMain.handle('bookmarks:list', async () => {
+ipcMain.handle('bookmarks:list', async (_e, opts = {}) => {
   if (!config.accountId) return { error: 'no account selected' };
+  const { bucket, chat } = opts;
+  if (!bucket || !chat) return { error: 'bucket and chat required' };
   try {
-    const list = await fetchBookmarks();
-    // Annotate each bookmark's creator with a clickable profile URL the
-    // forwarded-message recipient can use to ping the original author.
-    const base = (config.appHref || `https://3.basecamp.com/${config.accountId}`).replace(/\/$/, '');
-    for (const b of list) {
-      const c = b && b.recording && b.recording.creator;
-      if (c && c.id) c.profile_url = `${base}/people/${c.id}`;
-    }
-    return { ok: true, bookmarks: list };
+    const bookmarks = await fetchChatBookmarks(bucket, chat);
+    return { ok: true, bookmarks };
   } catch (e) { return { error: e.message }; }
 });
-ipcMain.handle('bookmark:delete', async (_e, bm) => {
-  try { return { ok: await tryDeleteBookmark(bm) }; }
+ipcMain.handle('bookmark:delete', async (_e, opts = {}) => {
+  const url = opts && opts.bookmarkUrl;
+  try { return { ok: await unbookmarkUrl(url) }; }
   catch (e) { return { ok: false, error: e.message }; }
 });
 ipcMain.handle('people:list', async () => {

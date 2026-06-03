@@ -486,11 +486,17 @@ bp.onFocusChanged(focused => {
 // ---- Forward bookmarked messages ----
 // Design: user bookmarks comments NATIVELY in Basecamp's "…" menu (no DOM
 // injection into the embedded webview). Clicking the toolbar Forward button
-// reads /my/bookmarks.json, filters to recordings in the currently-open
-// conversation made in the past 30 minutes, then sends one rich-text chat
-// line to the recipient with each bookmarked comment quoted + linked back
-// to its original author's profile.
-let fwdBookmarks = [];      // matching bookmarks frozen at dialog open
+// scans the recent lines in the currently-open conversation, checks each
+// line's bookmark_url to see which the user has bookmarked, then sends one
+// rich-text chat line to the chosen recipient with each bookmarked comment
+// quoted + linked back to its author's profile. After a successful forward
+// we auto-DELETE each bookmark via its bookmark_url (verified working).
+//
+// API caveat: bookmarks don't expose a `bookmarked_at` timestamp, so the
+// originally-spec'd "past 30 minutes" filter is dropped — the dialog
+// surfaces ALL currently-bookmarked lines in the chat. Auto-DELETE keeps
+// the set tight in practice.
+let fwdLines = [];          // bookmarked lines for the open chat, frozen at dialog open
 let fwdSending = false;
 const fwdOverlay  = $('#fwdOverlay');
 const fwdSearch   = $('#fwdSearch');
@@ -509,7 +515,7 @@ function closeForward() {
   fwdList.innerHTML = '';
   fwdSearch.value = '';
   fwdSearch.disabled = false;
-  fwdBookmarks = [];
+  fwdLines = [];
   fwdSending = false;
 }
 $('#fwdClose').onclick = closeForward;
@@ -518,61 +524,35 @@ window.addEventListener('keydown', e => {
   if (e.key === 'Escape' && fwdOverlay.classList.contains('show') && !fwdSending) closeForward();
 });
 
-function bookmarkInCurrentChat(b) {
-  if (!current || !b || !b.recording) return false;
-  const r = b.recording;
-  const bucketId = r.bucket && r.bucket.id;
-  // For chat lines, recording.parent is the Chat::Transcript whose id is the chat id.
-  const parentId = r.parent && r.parent.id;
-  return String(bucketId) === String(current.bucket)
-      && String(parentId) === String(current.chat);
-}
-// "Past 30 minutes" = since the user bookmarked it. /my/bookmarks.json entries
-// should carry their own created_at (when the bookmark was added). Fall back
-// to the recording's created_at if not present.
-function bookmarkAge(b) {
-  const t = (b && (b.created_at || b.bookmarked_at))
-          || (b && b.recording && b.recording.created_at);
-  return t ? (Date.now() - Date.parse(t)) : Number.POSITIVE_INFINITY;
-}
-
 async function openForward() {
   if (!current) { alert('Open a ping first, then click Forward.'); return; }
   fwdSummary.innerHTML = '';
   fwdList.innerHTML = '';
   fwdSearch.style.display = 'none';
   fwdOverlay.classList.add('show');
-  setFwdStatus('Loading bookmarks…');
+  setFwdStatus('Scanning this conversation for bookmarks…');
   let r;
-  try { r = await bp.listBookmarks(); }
+  try { r = await bp.listBookmarks(current.bucket, current.chat); }
   catch (e) { setFwdStatus('Error: ' + e.message); return; }
   if (r && r.error) { setFwdStatus('Error: ' + r.error); return; }
-  const all = (r && r.bookmarks) || [];
-  const WINDOW_MS = 30 * 60 * 1000;
-  const matching = all
-    .filter(bookmarkInCurrentChat)
-    .filter(b => bookmarkAge(b) <= WINDOW_MS)
-    .sort((a, b) => {
-      const ta = Date.parse(a.created_at || (a.recording && a.recording.created_at) || 0);
-      const tb = Date.parse(b.created_at || (b.recording && b.recording.created_at) || 0);
-      return ta - tb;
-    });
+  const matching = (r && r.bookmarks) || [];
   if (!matching.length) {
     setFwdStatus('');
     fwdSummary.innerHTML =
-      `<b>No bookmarks found in <i>${esc(current.name)}</i> from the last 30 minutes.</b><br>` +
-      `Bookmark the comments you want to forward — in the Basecamp pane on the right, ` +
-      `click the “…” next to each comment and choose <b>Bookmark</b>. Then click Forward again.`;
+      `<b>No bookmarked messages found in <i>${esc(current.name)}</i>.</b><br>` +
+      `In the Basecamp pane on the right, click the “…” next to each comment you want ` +
+      `to forward and choose <b>Bookmark</b>. Then click Forward again.`;
     return;
   }
-  fwdBookmarks = matching;
+  fwdLines = matching;
   fwdSummary.innerHTML = `<b>${matching.length}</b> bookmarked message` +
     `${matching.length === 1 ? '' : 's'} from <i>${esc(current.name)}</i> will be forwarded.`;
   setFwdStatus('Pick a recipient:');
   fwdSearch.style.display = '';
   fwdSearch.value = ''; fwdSearch.focus();
-  // Warm the people cache for typed-filter, then paint the default list.
-  ensurePeopleCache().then(() => renderRecipients(''));
+  // Warm the people cache (used to suggest non-pingable contacts when typed
+  // search comes up empty), then paint the default list.
+  ensurePeopleCache().then(() => { if (!fwdSearch.value) renderRecipients(''); });
   renderRecipients('');
 }
 
@@ -633,24 +613,23 @@ function cleanForwardHtml(html) {
     .replace(/<p(\s[^>]*)?>/gi, '<div>')
     .replace(/<\/p>/gi, '</div>');
 }
-function fwdBlockFor(b) {
-  const r = (b && b.recording) || {};
-  const c = r.creator || {};
+function fwdBlockFor(line) {
+  const c = line.creator || {};
   const url = c.profile_url || '';
   const safeName = esc(c.name || 'Someone');
   const lead = url
     ? `<div><a href="${esc(url)}">${safeName} wrote:</a></div>`
     : `<div><strong>${safeName} wrote:</strong></div>`;
-  return lead + `<div>${cleanForwardHtml(r.content)}</div>`;
+  return lead + `<div>${cleanForwardHtml(line.content)}</div>`;
 }
 
 async function sendForward(recipient) {
-  if (fwdSending || !recipient || !fwdBookmarks.length) return;
+  if (fwdSending || !recipient || !fwdLines.length) return;
   fwdSending = true;
   fwdSearch.disabled = true;
-  setFwdStatus(`Forwarding to ${recipient.name}…`);
+  setFwdStatus(`Forwarding ${fwdLines.length} message${fwdLines.length === 1 ? '' : 's'} to ${recipient.name}…`);
   // Compose one rich-text chat line that contains every bookmarked comment.
-  const html = fwdBookmarks.map(fwdBlockFor).join('<div><br></div>');
+  const html = fwdLines.map(fwdBlockFor).join('<div><br></div>');
   let res;
   try { res = await bp.sendLine(recipient.bucket, recipient.chat, html); }
   catch (e) { setFwdStatus('Forward failed: ' + e.message); fwdSearch.disabled = false; fwdSending = false; return; }
@@ -659,16 +638,14 @@ async function sendForward(recipient) {
     fwdSearch.disabled = false; fwdSending = false;
     return;
   }
-  // Best-effort: remove the bookmarks via the API. If Basecamp's bookmark
-  // DELETE endpoint isn't exposed to OAuth (likely — every shape I tried
-  // 404s), this falls through to a "remove manually" hint.
+  // Auto-DELETE each bookmark via its bookmark_url (verified working).
   let removed = 0, kept = 0;
-  for (const b of fwdBookmarks) {
-    const dr = await bp.deleteBookmark(b);
+  for (const l of fwdLines) {
+    const dr = await bp.deleteBookmark(l.bookmark_url);
     if (dr && dr.ok) removed++; else kept++;
   }
   if (kept === 0) {
-    setFwdStatus(`Forwarded ${fwdBookmarks.length} message${fwdBookmarks.length === 1 ? '' : 's'} to ${recipient.name}. Bookmarks removed.`, true);
+    setFwdStatus(`Forwarded ${fwdLines.length} message${fwdLines.length === 1 ? '' : 's'} to ${recipient.name}. Bookmarks cleared.`, true);
   } else {
     setFwdStatus(`Forwarded to ${recipient.name}. ${kept} bookmark${kept === 1 ? '' : 's'} couldn't be auto-removed — un-bookmark in Basecamp manually.`, true);
   }
