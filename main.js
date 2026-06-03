@@ -4,7 +4,7 @@
 // from /authorization.json. Right pane still embeds the real Basecamp chat in a
 // <webview> (sharing the same login session).
 
-const { app, BrowserWindow, ipcMain, session, shell, Notification } = require('electron');
+const { app, BrowserWindow, ipcMain, session, shell, Notification, clipboard } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const http = require('http');
@@ -439,6 +439,16 @@ ipcMain.handle('api:send-line', async (_e, { bucket, chat, html } = {}) => {
   if (!bucket || !chat || !html) return { error: 'missing bucket/chat/html' };
   try { const line = await sendChatLine(bucket, chat, html); return { ok: true, line }; }
   catch (e) { return { error: e.message }; }
+});
+ipcMain.handle('clipboard:write', (_e, { text, html } = {}) => {
+  try {
+    // Electron's clipboard.write puts BOTH plain text and HTML on the clipboard
+    // in one shot, so a paste into a rich-text editor (Mail, Basecamp, Notes)
+    // keeps formatting + author links, and a paste into a plain editor still
+    // gets readable text.
+    clipboard.write({ text: text || '', html: html || '' });
+    return { ok: true };
+  } catch (e) { return { ok: false, error: e.message }; }
 });
 
 // ---- App ----

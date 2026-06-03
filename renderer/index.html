@@ -112,7 +112,7 @@
   <div id="fwdOverlay" role="dialog" aria-modal="true">
     <div class="fwd-card">
       <div class="fwd-header">
-        <h3>Forward bookmarked messages</h3>
+        <h3 id="fwdTitle">Forward bookmarked messages</h3>
         <button class="fwd-close" id="fwdClose" title="Cancel">&times;</button>
       </div>
       <div class="fwd-summary" id="fwdSummary"></div>
@@ -138,6 +138,7 @@
         <span class="title" id="title">Select a ping — the real Basecamp chat loads here</span>
         <button id="reload" title="Reload">⟳</button>
         <button id="forwardBtn" title="Forward messages you bookmarked in Basecamp from this conversation">Forward ↪</button>
+        <button id="copyBtn" title="Copy messages you bookmarked in Basecamp to the clipboard (rich text + plain text)">Copy ⧉</button>
         <button id="openExt">Open in browser ↗</button>
       </div>
       <div id="frameWrap">
@@ -524,8 +525,13 @@ window.addEventListener('keydown', e => {
   if (e.key === 'Escape' && fwdOverlay.classList.contains('show') && !fwdSending) closeForward();
 });
 
-async function openForward() {
-  if (!current) { alert('Open a ping first, then click Forward.'); return; }
+// Shared scan: open the dialog with a "scanning…" status, fetch bookmarks for
+// the open chat, populate fwdLines, and return true if any matched. On empty
+// or error, fills the dialog with the appropriate message and returns false.
+// `verb` is shown in the empty-state hint so the user knows whether they're
+// being told to "forward" or "copy".
+async function scanCurrentChatBookmarks(verb) {
+  if (!current) { alert(`Open a ping first, then click ${verb}.`); return false; }
   fwdSummary.innerHTML = '';
   fwdList.innerHTML = '';
   fwdSearch.style.display = 'none';
@@ -533,20 +539,27 @@ async function openForward() {
   setFwdStatus('Scanning this conversation for bookmarks…');
   let r;
   try { r = await bp.listBookmarks(current.bucket, current.chat); }
-  catch (e) { setFwdStatus('Error: ' + e.message); return; }
-  if (r && r.error) { setFwdStatus('Error: ' + r.error); return; }
+  catch (e) { setFwdStatus('Error: ' + e.message); return false; }
+  if (r && r.error) { setFwdStatus('Error: ' + r.error); return false; }
   const matching = (r && r.bookmarks) || [];
   if (!matching.length) {
     setFwdStatus('');
     fwdSummary.innerHTML =
       `<b>No bookmarked messages found in <i>${esc(current.name)}</i>.</b><br>` +
       `In the Basecamp pane on the right, click the “…” next to each comment you want ` +
-      `to forward and choose <b>Bookmark</b>. Then click Forward again.`;
-    return;
+      `to ${verb} and choose <b>Bookmark</b>. Then click ${verb} again.`;
+    return false;
   }
   fwdLines = matching;
-  fwdSummary.innerHTML = `<b>${matching.length}</b> bookmarked message` +
-    `${matching.length === 1 ? '' : 's'} from <i>${esc(current.name)}</i> will be forwarded.`;
+  return true;
+}
+
+async function openForward() {
+  $('#fwdTitle').textContent = 'Forward bookmarked messages';
+  const ok = await scanCurrentChatBookmarks('forward');
+  if (!ok) return;
+  fwdSummary.innerHTML = `<b>${fwdLines.length}</b> bookmarked message` +
+    `${fwdLines.length === 1 ? '' : 's'} from <i>${esc(current.name)}</i> will be forwarded.`;
   setFwdStatus('Pick a recipient:');
   fwdSearch.style.display = '';
   fwdSearch.value = ''; fwdSearch.focus();
@@ -554,6 +567,19 @@ async function openForward() {
   // search comes up empty), then paint the default list.
   ensurePeopleCache().then(() => { if (!fwdSearch.value) renderRecipients(''); });
   renderRecipients('');
+}
+
+async function openCopy() {
+  $('#fwdTitle').textContent = 'Copy bookmarked messages';
+  const ok = await scanCurrentChatBookmarks('copy');
+  if (!ok) return;
+  // No recipient step for copy — go straight to clipboard.
+  fwdSearch.style.display = 'none';
+  fwdList.innerHTML = '';
+  fwdSummary.innerHTML = `Copying <b>${fwdLines.length}</b> bookmarked message` +
+    `${fwdLines.length === 1 ? '' : 's'} from <i>${esc(current.name)}</i>…`;
+  setFwdStatus('');
+  await runCopy();
 }
 
 // Recipient roster cache (full account, can_ping only). Used to expand
@@ -654,7 +680,62 @@ async function sendForward(recipient) {
   setTimeout(closeForward, 1800);
 }
 
+// ---- Copy bookmarked messages to clipboard ----
+// Sister of Forward: same bookmark scan, but writes the composed blocks to
+// the system clipboard (both rich text and plain text), then auto-removes
+// the bookmarks. No recipient picker.
+function htmlToText(html) {
+  if (!html) return '';
+  // Map block-level closers to newlines BEFORE stripping tags so paragraphs
+  // and divs render as actual line breaks in plain text.
+  const prepped = String(html)
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/(p|div|li|blockquote|h\d)>/gi, '\n')
+    .replace(/<bc-attachment[\s\S]*?<\/bc-attachment>/gi, '[attachment]');
+  const tmp = document.createElement('div');
+  tmp.innerHTML = prepped;
+  return (tmp.textContent || '').replace(/\n{3,}/g, '\n\n').trim();
+}
+function copyBlockText(line) {
+  const c = line.creator || {};
+  const name = c.name || 'Someone';
+  const url  = c.profile_url || '';
+  const head = url ? `${name} wrote: (${url})` : `${name} wrote:`;
+  const body = htmlToText(line.content);
+  return head + (body ? '\n' + body : '');
+}
+
+async function runCopy() {
+  if (fwdSending || !fwdLines.length) return;
+  fwdSending = true;
+  // Compose rich-text (same shape as forward) and plain-text versions.
+  const html = fwdLines.map(fwdBlockFor).join('<div><br></div>');
+  const text = fwdLines.map(copyBlockText).join('\n\n');
+  let cw;
+  try { cw = await bp.writeClipboard(text, html); }
+  catch (e) { setFwdStatus('Copy failed: ' + e.message); fwdSending = false; return; }
+  if (!cw || !cw.ok) {
+    setFwdStatus('Copy failed: ' + ((cw && cw.error) || 'unknown'));
+    fwdSending = false;
+    return;
+  }
+  // Auto-DELETE each bookmark.
+  let removed = 0, kept = 0;
+  for (const l of fwdLines) {
+    const dr = await bp.deleteBookmark(l.bookmark_url);
+    if (dr && dr.ok) removed++; else kept++;
+  }
+  const n = fwdLines.length;
+  if (kept === 0) {
+    setFwdStatus(`Copied ${n} bookmarked message${n === 1 ? '' : 's'} to the clipboard. Bookmarks cleared.`, true);
+  } else {
+    setFwdStatus(`Copied ${n} message${n === 1 ? '' : 's'} to the clipboard. ${kept} bookmark${kept === 1 ? '' : 's'} couldn't be auto-removed — un-bookmark in Basecamp manually.`, true);
+  }
+  setTimeout(closeForward, 2000);
+}
+
 $('#forwardBtn').onclick = openForward;
+$('#copyBtn').onclick = openCopy;
 
 boot();
 </script>
