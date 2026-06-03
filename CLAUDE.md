@@ -15,25 +15,37 @@ Basecamp — boosts, attachments, read receipts, live updates).
 | Preload (IPC bridge) | `preload.js` |
 | Entitlements (hardened runtime) | `entitlements.plist` |
 | App icon | `icon.icns` (ping-pong paddles logo) |
-| Build script | `build-dmg.sh` (signs, notarizes, staples, packages DMG) |
-| Package config | `package.json` |
-| Build output | `dist/bping-darwin-arm64/bping.app`, `dist/bping.dmg` |
-| Deployed bundles | `~/Documents/bping-apps/bping.app`, `~/Documents/bping-apps/bping.dmg` |
-| Deployed bundles (Desktop) | `~/Desktop/bping.app`, `~/Desktop/bping.dmg` |
+| Build script | `build-dmg.sh` (bumps version, packages, signs, optionally notarizes, builds DMG, deploys) |
+| Package config | `package.json` (version auto-bumped each build) |
+| Build output | `dist/bping-darwin-arm64/bping.app`, `dist/bping-v<version>.dmg` |
+| Deployed bundles | `~/Documents/bping-apps/bping.app`, `~/Documents/bping-apps/bping-v<version>.dmg` |
+| Deployed bundles (Desktop) | `~/Desktop/bping.app`, `~/Desktop/bping-v<version>.dmg` |
 
 ## Build & deploy
 
 ```bash
 cd ~/Documents/bping-native
-npm run package          # electron-packager → dist/bping-darwin-arm64/bping.app
-./build-dmg.sh           # signs all nested Mach-O, notarizes app, staples,
-                         # builds DMG, signs+notarizes+staples DMG. ~3 min.
-# Then copy app+dmg into ~/Documents/bping-apps/ and ~/Desktop/ (Finder cache may need touch)
+
+# Default: bump patch version, package, sign, build DMG, deploy. ~30 s.
+# Signed but NOT notarized — recipients see "developer cannot be verified"
+# on first launch and must right-click → Open.
+./build-dmg.sh
+
+# Release build: same as above + notary submission + staple. ~3-5 min.
+# DMG opens with no Gatekeeper warning.
+BPING_NOTARIZE=1 ./build-dmg.sh
+
+# Rebuild current version without bumping (e.g. retry a failed step).
+BPING_SKIP_BUMP=1 ./build-dmg.sh
 ```
 
-After `build-dmg.sh` succeeds, `spctl --assess` returns `accepted source=Notarized
-Developer ID`. Recipients double-click the DMG, drag to Applications, no Gatekeeper
-warning, no right-click-to-open.
+`build-dmg.sh` runs `electron-packager` itself, so `npm run package` is no longer
+a separate step. Older `bping-v*.dmg` files are removed from `dist/`,
+`~/Documents/bping-apps/`, and `~/Desktop/` on each successful build.
+
+After a notarized `build-dmg.sh` succeeds, `spctl --assess` returns
+`accepted source=Notarized Developer ID`. Recipients double-click the DMG, drag
+to Applications, no Gatekeeper warning, no right-click-to-open.
 
 ## Signing / notarization
 
@@ -41,6 +53,8 @@ warning, no right-click-to-open.
 - **Team ID:** `XLS3XF57J8`
 - **notarytool keychain profile:** `bping-notary` (stored via `xcrun notarytool store-credentials`)
 - Overridable via env: `BPING_SIGN_ID="..."` and `BPING_NOTARY_PROFILE="..."` for `build-dmg.sh`
+- **Notarization is opt-in:** `BPING_NOTARIZE=1 ./build-dmg.sh`. Without it the build is
+  signed-but-not-notarized (faster iteration; recipient warning on first launch).
 - If the cert isn't present, `build-dmg.sh` falls back to ad-hoc signing automatically.
 - **Signing approach:** walk every file in the bundle with `find`; if `file` reports
   it's Mach-O, codesign it with hardened runtime + timestamp + entitlements. Then
