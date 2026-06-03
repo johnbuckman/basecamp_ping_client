@@ -71,6 +71,30 @@
   #frameWrap { flex: 1; position: relative; }
   webview { width: 100%; height: 100%; border: 0; }
   #hint { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--muted); text-align: center; padding: 40px; pointer-events: none; }
+
+  /* Forward dialog */
+  #fwdOverlay { position: fixed; inset: 0; background: rgba(0,0,0,0.35); display: none;
+                align-items: flex-start; justify-content: center; z-index: 200; padding-top: 80px; }
+  #fwdOverlay.show { display: flex; }
+  .fwd-card { background: #fff; border: 1px solid var(--line); border-radius: 12px;
+              width: 480px; max-width: 92vw; padding: 16px 18px;
+              box-shadow: 0 10px 32px rgba(0,0,0,0.18); }
+  .fwd-header { display: flex; align-items: center; gap: 8px; }
+  .fwd-header h3 { margin: 0; font-size: 15px; flex: 1; }
+  .fwd-close { background: transparent; border: 0; font-size: 22px; line-height: 1;
+               cursor: pointer; color: var(--muted); padding: 0 4px; }
+  .fwd-close:hover { color: #000; }
+  .fwd-summary { margin: 10px 0 6px; font-size: 13px; color: #2b2926; }
+  .fwd-summary i { color: var(--accent-dk); font-style: normal; font-weight: 600; }
+  .fwd-status { font-size: 13px; color: #b3261e; min-height: 18px; margin: 4px 0; }
+  .fwd-status.ok { color: var(--accent-dk); }
+  #fwdSearch { width: 100%; border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px; font: inherit; margin-top: 6px; }
+  .fwd-list { max-height: 280px; overflow-y: auto; margin-top: 8px; }
+  .fwd-item { display: flex; gap: 10px; align-items: center; padding: 8px 8px; cursor: pointer;
+              border-radius: 6px; border: 0; background: transparent; width: 100%; text-align: left; font: inherit; }
+  .fwd-item:hover { background: #eef6f1; }
+  .fwd-item .avatar { width: 28px; height: 28px; }
+  .fwd-empty { padding: 14px 8px; color: var(--muted); font-size: 13px; text-align: center; }
 </style>
 </head>
 <body>
@@ -80,6 +104,22 @@
   <!-- Right-click context menu (used for "Mark as replied") -->
   <div id="ctxMenu" class="ctxmenu" role="menu">
     <button class="ctx-item" id="ctxMarkReplied">Mark as replied</button>
+  </div>
+
+  <!-- Forward dialog: opens when the toolbar Forward button is clicked.
+       Driven entirely by Basecamp bookmarks (user bookmarks comments natively
+       in Basecamp's UI; this app reads /my/bookmarks.json). -->
+  <div id="fwdOverlay" role="dialog" aria-modal="true">
+    <div class="fwd-card">
+      <div class="fwd-header">
+        <h3>Forward bookmarked messages</h3>
+        <button class="fwd-close" id="fwdClose" title="Cancel">&times;</button>
+      </div>
+      <div class="fwd-summary" id="fwdSummary"></div>
+      <div class="fwd-status" id="fwdStatus"></div>
+      <input id="fwdSearch" type="text" placeholder="Type to filter recipients…" autocomplete="off">
+      <div id="fwdList" class="fwd-list"></div>
+    </div>
   </div>
 
   <!-- Main app -->
@@ -97,6 +137,7 @@
       <div id="bar">
         <span class="title" id="title">Select a ping — the real Basecamp chat loads here</span>
         <button id="reload" title="Reload">⟳</button>
+        <button id="forwardBtn" title="Forward messages you bookmarked in Basecamp from this conversation">Forward ↪</button>
         <button id="openExt">Open in browser ↗</button>
       </div>
       <div id="frameWrap">
@@ -441,6 +482,202 @@ bp.onFocusChanged(focused => {
   setPoll(focused ? POLL_FOCUSED : POLL_AWAY);
   loadPeople();
 });
+
+// ---- Forward bookmarked messages ----
+// Design: user bookmarks comments NATIVELY in Basecamp's "…" menu (no DOM
+// injection into the embedded webview). Clicking the toolbar Forward button
+// reads /my/bookmarks.json, filters to recordings in the currently-open
+// conversation made in the past 30 minutes, then sends one rich-text chat
+// line to the recipient with each bookmarked comment quoted + linked back
+// to its original author's profile.
+let fwdBookmarks = [];      // matching bookmarks frozen at dialog open
+let fwdSending = false;
+const fwdOverlay  = $('#fwdOverlay');
+const fwdSearch   = $('#fwdSearch');
+const fwdList     = $('#fwdList');
+const fwdStatusEl = $('#fwdStatus');
+const fwdSummary  = $('#fwdSummary');
+
+function setFwdStatus(msg, ok) {
+  fwdStatusEl.textContent = msg || '';
+  fwdStatusEl.classList.toggle('ok', !!ok);
+}
+function closeForward() {
+  fwdOverlay.classList.remove('show');
+  setFwdStatus('');
+  fwdSummary.innerHTML = '';
+  fwdList.innerHTML = '';
+  fwdSearch.value = '';
+  fwdSearch.disabled = false;
+  fwdBookmarks = [];
+  fwdSending = false;
+}
+$('#fwdClose').onclick = closeForward;
+fwdOverlay.addEventListener('click', e => { if (e.target === fwdOverlay && !fwdSending) closeForward(); });
+window.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && fwdOverlay.classList.contains('show') && !fwdSending) closeForward();
+});
+
+function bookmarkInCurrentChat(b) {
+  if (!current || !b || !b.recording) return false;
+  const r = b.recording;
+  const bucketId = r.bucket && r.bucket.id;
+  // For chat lines, recording.parent is the Chat::Transcript whose id is the chat id.
+  const parentId = r.parent && r.parent.id;
+  return String(bucketId) === String(current.bucket)
+      && String(parentId) === String(current.chat);
+}
+// "Past 30 minutes" = since the user bookmarked it. /my/bookmarks.json entries
+// should carry their own created_at (when the bookmark was added). Fall back
+// to the recording's created_at if not present.
+function bookmarkAge(b) {
+  const t = (b && (b.created_at || b.bookmarked_at))
+          || (b && b.recording && b.recording.created_at);
+  return t ? (Date.now() - Date.parse(t)) : Number.POSITIVE_INFINITY;
+}
+
+async function openForward() {
+  if (!current) { alert('Open a ping first, then click Forward.'); return; }
+  fwdSummary.innerHTML = '';
+  fwdList.innerHTML = '';
+  fwdSearch.style.display = 'none';
+  fwdOverlay.classList.add('show');
+  setFwdStatus('Loading bookmarks…');
+  let r;
+  try { r = await bp.listBookmarks(); }
+  catch (e) { setFwdStatus('Error: ' + e.message); return; }
+  if (r && r.error) { setFwdStatus('Error: ' + r.error); return; }
+  const all = (r && r.bookmarks) || [];
+  const WINDOW_MS = 30 * 60 * 1000;
+  const matching = all
+    .filter(bookmarkInCurrentChat)
+    .filter(b => bookmarkAge(b) <= WINDOW_MS)
+    .sort((a, b) => {
+      const ta = Date.parse(a.created_at || (a.recording && a.recording.created_at) || 0);
+      const tb = Date.parse(b.created_at || (b.recording && b.recording.created_at) || 0);
+      return ta - tb;
+    });
+  if (!matching.length) {
+    setFwdStatus('');
+    fwdSummary.innerHTML =
+      `<b>No bookmarks found in <i>${esc(current.name)}</i> from the last 30 minutes.</b><br>` +
+      `Bookmark the comments you want to forward — in the Basecamp pane on the right, ` +
+      `click the “…” next to each comment and choose <b>Bookmark</b>. Then click Forward again.`;
+    return;
+  }
+  fwdBookmarks = matching;
+  fwdSummary.innerHTML = `<b>${matching.length}</b> bookmarked message` +
+    `${matching.length === 1 ? '' : 's'} from <i>${esc(current.name)}</i> will be forwarded.`;
+  setFwdStatus('Pick a recipient:');
+  fwdSearch.style.display = '';
+  fwdSearch.value = ''; fwdSearch.focus();
+  // Warm the people cache for typed-filter, then paint the default list.
+  ensurePeopleCache().then(() => renderRecipients(''));
+  renderRecipients('');
+}
+
+// Recipient roster cache (full account, can_ping only). Used to expand
+// search when the user types — defaults stay restricted to people the user
+// already has a ping with (we need a known bucket+chat to POST a line).
+let peopleAll = [];
+async function ensurePeopleCache() {
+  if (peopleAll.length) return;
+  try { const r = await bp.listPeople(); peopleAll = (r && r.people) || []; } catch (e) {}
+}
+function renderRecipients(q) {
+  const filter = (q || '').toLowerCase().trim();
+  fwdList.innerHTML = '';
+  // Default candidates: people in my current pings list (we know bucket+chat).
+  const pingable = peopleData
+    .filter(p => String(p.chat) !== String(current.chat))    // exclude the open chat itself
+    .map(p => ({ id: p.chat, name: p.name, avatar: p.avatar, bucket: p.bucket, chat: p.chat }));
+  let candidates = pingable;
+  if (filter) candidates = candidates.filter(p => p.name.toLowerCase().includes(filter));
+  if (!candidates.length) {
+    let note;
+    if (filter) {
+      // Mention any matching account people we found but can't send to (no existing ping).
+      const acctMatches = peopleAll.filter(p => p.name && p.name.toLowerCase().includes(filter));
+      if (acctMatches.length) {
+        note = `No matching recipients in your pings list. ` +
+               `Start a ping in Basecamp first with ` +
+               `${acctMatches.slice(0,3).map(p => p.name).join(', ')}, ` +
+               `then forward.`;
+      } else {
+        note = `No matches.`;
+      }
+    } else {
+      note = `No other ping conversations available.`;
+    }
+    fwdList.innerHTML = `<div class="fwd-empty">${esc(note)}</div>`;
+    return;
+  }
+  for (const p of candidates) {
+    const b = document.createElement('button');
+    b.className = 'fwd-item';
+    b.innerHTML = `<img class="avatar" src="${esc(p.avatar)}" alt="">` +
+                  `<span class="name">${esc(p.name)}</span>`;
+    b.onclick = () => sendForward(p);
+    fwdList.appendChild(b);
+  }
+}
+fwdSearch.addEventListener('input', () => renderRecipients(fwdSearch.value));
+
+// Basecamp chat lines accept text/html but only with:
+//   div, h1, br, strong, em, strike, a[href], pre, ol, ul, li, blockquote
+// — anything else risks 422 / strip. Map <p> → <div>, strip <bc-attachment>.
+function cleanForwardHtml(html) {
+  if (!html) return '';
+  return String(html)
+    .replace(/<bc-attachment[\s\S]*?<\/bc-attachment>/gi, '[attachment — view original in Basecamp]')
+    .replace(/<p(\s[^>]*)?>/gi, '<div>')
+    .replace(/<\/p>/gi, '</div>');
+}
+function fwdBlockFor(b) {
+  const r = (b && b.recording) || {};
+  const c = r.creator || {};
+  const url = c.profile_url || '';
+  const safeName = esc(c.name || 'Someone');
+  const lead = url
+    ? `<div><a href="${esc(url)}">${safeName} wrote:</a></div>`
+    : `<div><strong>${safeName} wrote:</strong></div>`;
+  return lead + `<div>${cleanForwardHtml(r.content)}</div>`;
+}
+
+async function sendForward(recipient) {
+  if (fwdSending || !recipient || !fwdBookmarks.length) return;
+  fwdSending = true;
+  fwdSearch.disabled = true;
+  setFwdStatus(`Forwarding to ${recipient.name}…`);
+  // Compose one rich-text chat line that contains every bookmarked comment.
+  const html = fwdBookmarks.map(fwdBlockFor).join('<div><br></div>');
+  let res;
+  try { res = await bp.sendLine(recipient.bucket, recipient.chat, html); }
+  catch (e) { setFwdStatus('Forward failed: ' + e.message); fwdSearch.disabled = false; fwdSending = false; return; }
+  if (res && res.error) {
+    setFwdStatus('Forward failed: ' + res.error);
+    fwdSearch.disabled = false; fwdSending = false;
+    return;
+  }
+  // Best-effort: remove the bookmarks via the API. If Basecamp's bookmark
+  // DELETE endpoint isn't exposed to OAuth (likely — every shape I tried
+  // 404s), this falls through to a "remove manually" hint.
+  let removed = 0, kept = 0;
+  for (const b of fwdBookmarks) {
+    const dr = await bp.deleteBookmark(b);
+    if (dr && dr.ok) removed++; else kept++;
+  }
+  if (kept === 0) {
+    setFwdStatus(`Forwarded ${fwdBookmarks.length} message${fwdBookmarks.length === 1 ? '' : 's'} to ${recipient.name}. Bookmarks removed.`, true);
+  } else {
+    setFwdStatus(`Forwarded to ${recipient.name}. ${kept} bookmark${kept === 1 ? '' : 's'} couldn't be auto-removed — un-bookmark in Basecamp manually.`, true);
+  }
+  // Refresh the pings list so the new sent line bumps the recipient up.
+  loadPeople({ forceFull: true });
+  setTimeout(closeForward, 1800);
+}
+
+$('#forwardBtn').onclick = openForward;
 
 boot();
 </script>

@@ -152,6 +152,89 @@ async function bearerFetch(absUrl) {
 }
 const api = p => bearerFetch(`${API_ROOT}/${config.accountId}${p}`);
 
+// Generic bearer-auth fetch with method + optional JSON body. Used for
+// POST/PUT/DELETE — returns the raw Response so callers can inspect status.
+async function bearerSend(absUrl, method, body) {
+  await validToken();
+  const headers = {
+    Authorization: 'Bearer ' + tokens.access_token,
+    'User-Agent': UA,
+    Accept: 'application/json',
+  };
+  const opts = { method, headers };
+  if (body !== undefined && body !== null) {
+    headers['Content-Type'] = 'application/json';
+    opts.body = JSON.stringify(body);
+  }
+  let r = await fetch(absUrl, opts);
+  if (r.status === 401) {
+    await refreshTokens();
+    headers.Authorization = 'Bearer ' + tokens.access_token;
+    r = await fetch(absUrl, opts);
+  }
+  return r;
+}
+const apiSend = (p, method, body) => bearerSend(`${API_ROOT}/${config.accountId}${p}`, method, body);
+
+// --- Bookmarks / forward helpers ----------------------------------------
+// GET /my/bookmarks.json returns null when empty; treat as empty list.
+async function fetchBookmarks() {
+  const r = await apiSend('/my/bookmarks.json', 'GET');
+  if (!r.ok) throw new Error('bookmarks HTTP ' + r.status);
+  const txt = await r.text();
+  if (!txt || txt.trim() === 'null') return [];
+  try { const j = JSON.parse(txt); return Array.isArray(j) ? j : []; }
+  catch (e) { return []; }
+}
+
+// Bookmark delete: Basecamp doesn't document which URL shape is the right one
+// for OAuth (the web-UI uses session cookies, and every shape I tried returns
+// 404). Try the plausible ones — return true on any 2xx.
+async function tryDeleteBookmark(bm) {
+  const recId = bm && bm.recording && bm.recording.id;
+  const bucketId = bm && bm.recording && bm.recording.bucket && bm.recording.bucket.id;
+  const bmId = bm && bm.id;
+  const paths = [];
+  if (bmId) paths.push(`/my/bookmarks/${bmId}.json`);
+  if (recId && recId !== bmId) paths.push(`/my/bookmarks/${recId}.json`);
+  if (bucketId && recId) {
+    paths.push(`/buckets/${bucketId}/recordings/${recId}/bookmark.json`);
+    paths.push(`/buckets/${bucketId}/recordings/${recId}/bookmarks.json`);
+  }
+  for (const p of paths) {
+    try {
+      const r = await apiSend(p, 'DELETE');
+      if (r.ok || r.status === 204) return true;
+    } catch (e) { /* try the next shape */ }
+  }
+  return false;
+}
+
+async function sendChatLine(bucket, chat, html) {
+  const r = await apiSend(`/buckets/${bucket}/chats/${chat}/lines.json`,
+    'POST', { content: html, content_type: 'text/html' });
+  if (!r.ok) {
+    const txt = await r.text().catch(() => '');
+    throw new Error('send line HTTP ' + r.status + (txt ? ' — ' + txt.slice(0, 200) : ''));
+  }
+  try { return await r.json(); } catch (e) { return {}; }
+}
+
+// Full account roster — for the recipient filter. Cached ~25 min.
+let peopleCache = { at: 0, list: [] };
+async function fetchAllPeople() {
+  if (peopleCache.list.length && Date.now() - peopleCache.at < 25 * 60 * 1000) return peopleCache.list;
+  const out = [];
+  for (let page = 1; page <= 10; page++) {
+    let p; try { p = await api(`/people.json?page=${page}`); } catch (e) { break; }
+    if (!Array.isArray(p) || !p.length) break;
+    for (const x of p) if (x.can_ping) out.push({ id: x.id, name: x.name, avatar: x.avatar_url });
+    if (p.length < 50) break;
+  }
+  peopleCache = { at: Date.now(), list: out };
+  return out;
+}
+
 async function listAccounts() {
   const j = await bearerFetch(`${LAUNCHPAD}/authorization.json`);
   identityCache = j.identity || null;
@@ -290,12 +373,42 @@ ipcMain.handle('signout', async () => {
   config.accountId = null; config.appHref = null;
   try { writeJSON(CFG_PATH, config); } catch (e) {}
   me = null; identityCache = null;
+  peopleCache = { at: 0, list: [] };
   // Clear the webview's Basecamp session too, otherwise the right pane stays logged in.
   try { await session.fromPartition(PARTITION).clearStorageData(); } catch (e) {}
   return { ok: true };
 });
 ipcMain.handle('open-external', (_e, url) => { if (/^https?:\/\//.test(url || '')) shell.openExternal(url); });
 ipcMain.handle('app:focused', () => !!(mainWin && mainWin.isFocused()));
+
+// --- Forward feature IPC ----------------------------------------------------
+ipcMain.handle('bookmarks:list', async () => {
+  if (!config.accountId) return { error: 'no account selected' };
+  try {
+    const list = await fetchBookmarks();
+    // Annotate each bookmark's creator with a clickable profile URL the
+    // forwarded-message recipient can use to ping the original author.
+    const base = (config.appHref || `https://3.basecamp.com/${config.accountId}`).replace(/\/$/, '');
+    for (const b of list) {
+      const c = b && b.recording && b.recording.creator;
+      if (c && c.id) c.profile_url = `${base}/people/${c.id}`;
+    }
+    return { ok: true, bookmarks: list };
+  } catch (e) { return { error: e.message }; }
+});
+ipcMain.handle('bookmark:delete', async (_e, bm) => {
+  try { return { ok: await tryDeleteBookmark(bm) }; }
+  catch (e) { return { ok: false, error: e.message }; }
+});
+ipcMain.handle('people:list', async () => {
+  try { return { ok: true, people: await fetchAllPeople() }; }
+  catch (e) { return { error: e.message }; }
+});
+ipcMain.handle('api:send-line', async (_e, { bucket, chat, html } = {}) => {
+  if (!bucket || !chat || !html) return { error: 'missing bucket/chat/html' };
+  try { const line = await sendChatLine(bucket, chat, html); return { ok: true, line }; }
+  catch (e) { return { error: e.message }; }
+});
 
 // ---- App ----
 function stripFraming(sess) {

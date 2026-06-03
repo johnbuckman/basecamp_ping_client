@@ -15,4 +15,9 @@ contextBridge.exposeInMainWorld('bping', {
   isFocused: () => ipcRenderer.invoke('app:focused'),
   onFocusChanged: (cb) => ipcRenderer.on('focus-changed', (_e, focused) => cb(!!focused)),
   onMessageSent: (cb) => ipcRenderer.on('message-sent', () => cb()),
+  // Forward feature
+  listBookmarks: () => ipcRenderer.invoke('bookmarks:list'),
+  deleteBookmark: (bm) => ipcRenderer.invoke('bookmark:delete', bm),
+  listPeople: () => ipcRenderer.invoke('people:list'),
+  sendLine: (bucket, chat, html) => ipcRenderer.invoke('api:send-line', { bucket, chat, html }),
 });
