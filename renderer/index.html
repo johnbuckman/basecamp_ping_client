@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Basecamp Pings — Native</title>
+<style>
+  :root { --bg:#f6f5f3; --panel:#fff; --line:#e3e1dd; --muted:#6b6862; --accent:#1b8a5a; --accent-dk:#14633f; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { height: 100vh; overflow: hidden; background: var(--bg);
+         font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; color: #2b2926; }
+
+  /* gate (setup / connect / picker) */
+  #gate { position: fixed; inset: 0; background: var(--bg); display: none; align-items: center; justify-content: center; z-index: 10; }
+  #gate.show { display: flex; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 26px 28px; width: 460px; max-width: 92vw; }
+  .card h2 { margin: 0 0 6px; font-size: 18px; }
+  .card p { margin: 6px 0 14px; color: var(--muted); }
+  .card label { display: block; font-size: 12px; font-weight: 600; margin: 10px 0 4px; }
+  .card input { width: 100%; border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px; font: inherit; }
+  .card .btn { margin-top: 16px; background: var(--accent); color: #fff; border: 0; border-radius: 8px; padding: 10px 16px;
+               font-weight: 600; cursor: pointer; font-size: 14px; }
+  .card .btn:hover { background: var(--accent-dk); }
+  .card .btn.secondary { background: #fff; color: var(--accent-dk); border: 1px solid var(--line); }
+  .card a { color: var(--accent-dk); cursor: pointer; }
+  .card .note { font-size: 12px; }
+  .card code { background: #f0efed; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+  .acct { display: block; width: 100%; text-align: left; border: 1px solid var(--line); background: #fff; border-radius: 8px;
+          padding: 10px 12px; margin-top: 8px; cursor: pointer; font: inherit; }
+  .acct:hover { background: #eef6f1; }
+  .err { color: #b3261e; font-size: 13px; margin-top: 10px; min-height: 16px; }
+
+  /* main app */
+  #app { display: none; height: 100vh; }
+  #app.show { display: flex; }
+  #left { width: 320px; min-width: 320px; background: var(--panel); border-right: 1px solid var(--line); display: flex; flex-direction: column; }
+  #left header { padding: 12px 14px; border-bottom: 1px solid var(--line); display: flex; gap: 8px; align-items: center; }
+  #left header h1 { font-size: 15px; margin: 0; flex: 1; }
+  #left header button { border: 1px solid var(--line); background: #fff; border-radius: 6px; padding: 4px 9px; cursor: pointer; font-size: 12px; }
+  #left header button:hover { background: #f0efed; }
+  #list { overflow-y: auto; flex: 1; }
+  .group-label { padding: 10px 14px 4px; font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+  .row { display: flex; gap: 10px; padding: 10px 14px; cursor: pointer; border-bottom: 1px solid #f0efed; align-items: center; background: #F0F0F0; }   /* default = (new) */
+  .row:hover { background: #e6e6e6; }
+  .row.replied { background: #FFFFFF; }
+  .row.replied:hover { background: #faf9f7; }
+  .row.active { background: #eef6f1; }     /* selected wins over (new)/(replied) */
+  .row.unread .name { font-weight: 700; }
+  .avatar { width: 36px; height: 36px; border-radius: 50%; object-fit: cover; background: #ddd; flex-shrink: 0; }
+  .meta { flex: 1; min-width: 0; }
+  .top { display: flex; justify-content: space-between; gap: 8px; }
+  .name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .date { color: var(--muted); font-size: 12px; white-space: nowrap; flex-shrink: 0; }
+  .excerpt { color: var(--muted); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .badge { background: var(--accent); color: #fff; border-radius: 11px; min-width: 22px; height: 22px; padding: 0 6px;
+           font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; }
+  .empty { padding: 22px 14px; color: var(--muted); }
+
+  /* Right-click context menu */
+  .ctxmenu { position: fixed; min-width: 160px; padding: 4px; background: #fff; border: 1px solid var(--line);
+             border-radius: 8px; box-shadow: 0 6px 20px rgba(0,0,0,0.12); z-index: 100; display: none; }
+  .ctxmenu.show { display: block; }
+  .ctxmenu .ctx-item { display: block; width: 100%; text-align: left; padding: 7px 10px; border: 0;
+                       background: transparent; cursor: pointer; font: inherit; border-radius: 5px; }
+  .ctxmenu .ctx-item:hover { background: #eef6f1; }
+  #right { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  #bar { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  #bar .title { font-weight: 700; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #bar button { border: 1px solid var(--line); background: #fff; border-radius: 6px; padding: 5px 10px; cursor: pointer; font-size: 12px; }
+  #bar button:hover { background: #f0efed; }
+  #frameWrap { flex: 1; position: relative; }
+  webview { width: 100%; height: 100%; border: 0; }
+  #hint { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--muted); text-align: center; padding: 40px; pointer-events: none; }
+</style>
+</head>
+<body>
+  <!-- Gate: setup / connect / account picker -->
+  <div id="gate" class="show"><div class="card" id="gateCard"></div></div>
+
+  <!-- Right-click context menu (used for "Mark as replied") -->
+  <div id="ctxMenu" class="ctxmenu" role="menu">
+    <button class="ctx-item" id="ctxMarkReplied">Mark as replied</button>
+  </div>
+
+  <!-- Main app -->
+  <div id="app">
+    <div id="left">
+      <header>
+        <h1>Pings</h1>
+        <button id="acctBtn" title="Switch account">Account</button>
+        <button id="signOutBtn" title="Sign out of Basecamp">Sign out</button>
+        <button id="refresh">Refresh</button>
+      </header>
+      <div id="list"><div class="empty">Loading…</div></div>
+    </div>
+    <div id="right">
+      <div id="bar">
+        <span class="title" id="title">Select a ping — the real Basecamp chat loads here</span>
+        <button id="reload" title="Reload">⟳</button>
+        <button id="openExt">Open in browser ↗</button>
+      </div>
+      <div id="frameWrap">
+        <webview id="bc" partition="persist:basecamp" allowpopups src="about:blank"></webview>
+        <div id="hint">Click a person on the left to open your real Basecamp ping here<br>(full features: boosts, replies, attachments, read receipts)</div>
+      </div>
+    </div>
+  </div>
+
+<script>
+const $ = s => document.querySelector(s);
+const bp = window.bping;
+let current = null, peopleSig = null, peopleTimer = null;
+let peopleData = [];
+const readLocally = new Set();   // chats opened this session — kept 'read' until the server catches up
+let focusComposer = false;       // after opening a ping, focus Basecamp's compose box once it loads
+let knownUnread = null;          // chatId -> lastDate from previous poll, to detect newly-arrived pings
+let firstLoad = true;            // auto-open the most recent ping after the first successful fetch
+// Conversations the user manually flagged as "(replied)" via the right-click menu.
+// Stored as Map<chatId, lastDateAtMarkTime>: when lastDate advances (new activity),
+// the mark expires and the row becomes (new) again.
+let markedReplied = new Map();
+try { markedReplied = new Map(JSON.parse(localStorage.getItem('bping:markedReplied') || '[]')); } catch (e) {}
+function saveMarked() {
+  try { localStorage.setItem('bping:markedReplied', JSON.stringify([...markedReplied])); } catch (e) {}
+}
+let away = false;                // app not focused → poll faster + lighter to catch new pings
+const POLL_FOCUSED = 30000, POLL_AWAY = 10000;
+const frame = $('#bc');
+
+function relTime(iso) {
+  const d = new Date(iso), now = new Date(), s = (now - d) / 1000;
+  if (s < 60) return 'just now';
+  if (s < 3600) return Math.floor(s / 60) + 'm ago';
+  if (s < 86400) return Math.floor(s / 3600) + 'h ago';
+  if (s < 604800) return Math.floor(s / 86400) + 'd ago';
+  return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: d.getFullYear() === now.getFullYear() ? undefined : 'numeric' });
+}
+function esc(s){ const d=document.createElement('div'); d.textContent=s==null?'':s; return d.innerHTML; }
+function showGate(html){ $('#gate').classList.add('show'); $('#app').classList.remove('show'); $('#gateCard').innerHTML = html; }
+function hideGate(){ $('#gate').classList.remove('show'); $('#app').classList.add('show'); }
+
+// ---- boot / state machine ----
+async function boot() {
+  const st = await bp.getState();
+  if (!st.configured) return setupScreen(st);
+  if (!st.authed) return connectScreen();
+  if (!st.accountId) return pickerScreen();
+  startApp(st.appHref);
+}
+
+function setupScreen(st) {
+  showGate(`
+    <h2>Connect Basecamp (OAuth2)</h2>
+    <p class="note">This app talks to the Basecamp API directly. Register a free integration, then paste its credentials here.</p>
+    <ol class="note" style="margin:0 0 8px 18px;padding:0">
+      <li>Open <a id="reg">launchpad.37signals.com/integrations</a> and create an integration.</li>
+      <li>Set its <b>Redirect URI</b> to exactly the value below.</li>
+      <li>Copy the Client ID &amp; Client Secret here.</li>
+    </ol>
+    <label>Client ID</label><input id="cid" value="${esc(st.clientId)}" placeholder="...">
+    <label>Client Secret</label><input id="csec" type="password" placeholder="...">
+    <label>Redirect URI (must match your integration)</label><input id="ruri" value="${esc(st.redirectUri || st.defaultRedirect)}">
+    <div class="err" id="err"></div>
+    <button class="btn" id="save">Save &amp; continue</button>
+  `);
+  $('#reg').onclick = () => bp.openExternal('https://launchpad.37signals.com/integrations');
+  $('#save').onclick = async () => {
+    const clientId = $('#cid').value.trim(), clientSecret = $('#csec').value.trim(), redirectUri = $('#ruri').value.trim();
+    if (!clientId || !clientSecret) { $('#err').textContent = 'Client ID and Secret are required.'; return; }
+    await bp.saveCreds({ clientId, clientSecret, redirectUri });
+    connectScreen();
+  };
+}
+
+function connectScreen(prevError) {
+  showGate(`
+    <h2>Sign in to Basecamp</h2>
+    <p>Clicking <b>Connect</b> opens your default browser to sign in (so passkeys and any existing Basecamp login work). After you authorize, bping picks up automatically — you can close the browser tab.</p>
+    <div class="err" id="err"></div>
+    <button class="btn" id="go">Connect to Basecamp</button>
+  `);
+  if (prevError) $('#err').textContent = prevError;
+  $('#go').onclick = async () => {
+    waitingScreen();
+    const r = await bp.startAuth();
+    if (r.error) {
+      // Don't show "cancelled" as an error — it's expected feedback for Cancel.
+      const msg = /cancel/i.test(r.error) ? '' : r.error;
+      connectScreen(msg);
+      return;
+    }
+    handleAccounts(r.accounts);
+  };
+}
+
+function waitingScreen() {
+  showGate(`
+    <h2>Waiting for sign-in…</h2>
+    <p>Complete the sign-in in your browser. bping will continue automatically once you authorize. You can close the browser tab after it says "Sign-in complete".</p>
+    <div class="err" id="err"></div>
+    <button class="btn secondary" id="cancel">Cancel</button>
+  `);
+  $('#cancel').onclick = () => { bp.cancelAuth(); /* startAuth promise will reject; connectScreen is shown by its handler */ };
+}
+
+async function pickerScreen() {
+  showGate(`<h2>Loading accounts…</h2><div class="err" id="err"></div>`);
+  const r = await bp.listAccounts();
+  if (r.error) { $('#err').textContent = r.error; return; }
+  handleAccounts(r.accounts);
+}
+
+function handleAccounts(accounts) {
+  if (!accounts || !accounts.length) { showGate(`<h2>No Basecamp accounts</h2><p>This login has no Basecamp 3/4 accounts.</p>`); return; }
+  if (accounts.length === 1) return selectAccount(accounts[0]);
+  showGate(`<h2>Choose an account</h2><p>You have access to several — pick one.</p><div id="accts"></div>`);
+  const box = $('#accts');
+  accounts.forEach(a => {
+    const b = document.createElement('button');
+    b.className = 'acct'; b.textContent = a.name + '  (#' + a.id + ')';
+    b.onclick = () => selectAccount(a);
+    box.appendChild(b);
+  });
+}
+async function selectAccount(a) {
+  await bp.setAccount({ id: a.id, appHref: a.appHref });
+  startApp(a.appHref);
+}
+
+function startApp(appHref) {
+  hideGate();
+  if (appHref) frame.src = appHref.replace(/\/?$/, '/');   // account home (login/session for the webview)
+  firstLoad = true;            // re-arm auto-open after a fresh start (account switch / re-sign-in)
+  loadPeople();
+  setPoll(POLL_FOCUSED);
+}
+
+// ---- pings list ----
+async function loadPeople(opts) {
+  // opts.forceFull = ignore the away/light flag so manual refreshes and the
+  // post-send refresh always get the latest-line correction (and thus the new
+  // lastMine/excerpt/lastDate for the conversation just sent to).
+  const useLight = (opts && opts.forceFull) ? false : away;
+  let data;
+  try { data = await bp.getPings({ light: useLight }); } catch (e) { $('#list').innerHTML = '<div class="empty">Failed to load.</div>'; return; }
+  if (data.error) { $('#list').innerHTML = '<div class="empty">' + esc(data.error) + '</div>'; return; }
+  // Carry over knowledge from the previous poll. Background "light" polls skip
+  // the latest-line refinement — so they return lastMine=undefined, a regressed
+  // lastDate, and an excerpt without any "You: " prefix. Without this merge, a
+  // row that was correctly (replied) in a focused poll would flip back to (new)
+  // the next time a light poll runs. We only carry over fields when the new
+  // poll shows no new activity (lastDate did not advance).
+  const prevByChat = new Map((peopleData || []).map(x => [x.chat, x]));
+  data.people.forEach(p => {
+    const prev = prevByChat.get(p.chat);
+    if (!prev) return;
+    if (new Date(p.lastDate) <= new Date(prev.lastDate)) {
+      if (p.lastMine === undefined && prev.lastMine !== undefined) p.lastMine = prev.lastMine;
+      if (prev.excerpt) p.excerpt = prev.excerpt;
+      if (new Date(prev.lastDate) > new Date(p.lastDate)) p.lastDate = prev.lastDate;
+    }
+  });
+  data.people.forEach(p => {       // honor optimistic reads until the server agrees
+    if (readLocally.has(p.chat)) {
+      if (p.unread) { p.unread = false; p.unreadCount = 0; }
+      else readLocally.delete(p.chat);
+    }
+  });
+  // Expire "Mark as replied" flags only when new activity ACTUALLY arrived (lastDate
+  // advanced) or the conversation went away. A date that regresses — e.g., a
+  // background light-poll skipping the latest-line refinement — must NOT expire
+  // the mark, otherwise the row briefly reverts to (new). That was the bug.
+  let markedChanged = false;
+  for (const chat of [...markedReplied.keys()]) {
+    const pp = data.people.find(x => String(x.chat) === String(chat));
+    if (!pp || new Date(pp.lastDate) > new Date(markedReplied.get(chat))) {
+      markedReplied.delete(chat);
+      markedChanged = true;
+    }
+  }
+  if (markedChanged) saveMarked();
+  const sig = JSON.stringify(data.people);
+  if (sig === peopleSig) { highlightActive(); return; }
+  peopleSig = sig;
+  peopleData = data.people;
+  renderList();
+  // On the first successful load, auto-open the most recent ping (unless the user
+  // already clicked one during the fetch). "Most recent" = max lastDate overall.
+  if (firstLoad && !current && peopleData.length) {
+    const mostRecent = peopleData.reduce((a, b) =>
+      !a || new Date(b.lastDate) > new Date(a.lastDate) ? b : a, null);
+    if (mostRecent) openConvo(mostRecent);
+  }
+  firstLoad = false;
+  maybeAutoSelect(data.people);
+}
+// When the app isn't focused, auto-open a newly-arrived ping so it's ready when you return.
+async function maybeAutoSelect(people) {
+  const cur = new Map(people.filter(p => p.unread).map(p => [p.chat, p.lastDate]));
+  if (knownUnread !== null) {
+    const fresh = people.filter(p => p.unread &&
+      (!knownUnread.has(p.chat) || new Date(p.lastDate) > new Date(knownUnread.get(p.chat))));
+    if (fresh.length) {
+      // Native macOS notification for each new incoming ping.
+      fresh.forEach(p => bp.notify({
+        title: 'New ping from ' + p.name,
+        body: p.excerpt || '',
+        chat: p.chat,
+      }));
+      let focused = true; try { focused = await bp.isFocused(); } catch (e) {}
+      if (!focused) {
+        fresh.sort((a, b) => new Date(b.lastDate) - new Date(a.lastDate));
+        openConvo(fresh[0]);
+      }
+    }
+  }
+  knownUnread = cur;
+}
+function renderList() {
+  const list = $('#list'); list.innerHTML = '';
+  if (!peopleData.length) { list.innerHTML = '<div class="empty">No pings found.</div>'; return; }
+  const unread = peopleData.filter(p => p.unread), read = peopleData.filter(p => !p.unread);
+  if (unread.length) { list.appendChild(label('Unread')); unread.forEach(p => list.appendChild(rowEl(p))); }
+  if (read.length) { list.appendChild(label('Earlier')); read.forEach(p => list.appendChild(rowEl(p))); }
+  highlightActive();
+}
+function label(t){ const d=document.createElement('div'); d.className='group-label'; d.textContent=t; return d; }
+function highlightActive(){ document.querySelectorAll('#list .row').forEach(r => r.classList.toggle('active', !!current && r.dataset.chat === String(current.chat))); }
+function rowEl(p) {
+  // "Replied" = the latest line is from me, OR the user manually marked it as replied
+  // (manual marks auto-expire when this conversation's lastDate advances — see loadPeople).
+  const naturallyReplied = p.lastMine !== undefined ? !!p.lastMine : (p.excerpt || '').startsWith('You: ');
+  // Manual marks stay valid as long as they remain in the map — loadPeople only
+  // removes them when lastDate actually advances. No strict date-equality check
+  // here, which would falsely flip the row to (new) on a light-mode poll.
+  const manuallyReplied = markedReplied.has(p.chat);
+  const replied = naturallyReplied || manuallyReplied;
+  // Suffix: show "(replied)" only when we actually replied. Manual marks get the
+  // (replied) background (#FFFFFF) but NO suffix — we didn't actually reply.
+  const suffix = naturallyReplied ? ' (replied)' : (manuallyReplied ? '' : ' (new)');
+  const row = document.createElement('div');
+  row.className = 'row' + (p.unread ? ' unread' : '') + (replied ? ' replied' : '');
+  row.dataset.chat = p.chat;
+  row.innerHTML = `
+    <img class="avatar" src="${esc(p.avatar)}" alt="">
+    <div class="meta">
+      <div class="top"><span class="name"></span><span class="date">${relTime(p.lastDate)}</span></div>
+      <div class="top"><span class="excerpt"></span>${p.unread && p.unreadCount ? `<span class="badge">${p.unreadCount}</span>` : ''}</div>
+    </div>`;
+  row.querySelector('.name').textContent = p.name + suffix;
+  row.querySelector('.excerpt').textContent = p.excerpt;
+  row.onclick = () => openConvo(p);
+  row.oncontextmenu = (e) => {
+    e.preventDefault();
+    if (replied) return;          // only offer "Mark as replied" on (new) items
+    showCtxMenu(p, e.clientX, e.clientY);
+  };
+  return row;
+}
+function openConvo(p) {
+  current = p;
+  $('#title').textContent = p.name;
+  $('#hint').style.display = 'none';
+  frame.src = p.appUrl;
+  focusComposer = true;            // focus the message box once this ping loads
+  if (p.unread) {                  // opening reads it — move to 'Earlier' immediately
+    p.unread = false; p.unreadCount = 0;
+    readLocally.add(p.chat);
+    peopleSig = null;              // let the next server refresh re-render
+    renderList();
+  } else {
+    highlightActive();
+  }
+}
+
+$('#refresh').onclick = () => loadPeople({ forceFull: true });
+// Refresh immediately when the user sends a ping in the embedded Basecamp webview.
+bp.onMessageSent(() => loadPeople({ forceFull: true }));
+$('#reload').onclick = () => { try { frame.reload(); } catch (e) {} };
+$('#openExt').onclick = () => { if (current) bp.openExternal(current.appUrl); };
+$('#acctBtn').onclick = pickerScreen;
+$('#signOutBtn').onclick = signOut;
+// Clicking a system notification focuses the app and opens that conversation.
+bp.onNotifyClick(({ chat }) => {
+  if (!chat) return;
+  const p = peopleData.find(x => String(x.chat) === String(chat));
+  if (p) openConvo(p);
+});
+
+// ---- right-click "Mark as replied" context menu ----
+const ctxMenu = $('#ctxMenu');
+let ctxChat = null;
+function showCtxMenu(p, x, y) {
+  ctxChat = p.chat;
+  ctxMenu.style.left = Math.min(x, window.innerWidth - 180) + 'px';
+  ctxMenu.style.top = Math.min(y, window.innerHeight - 50) + 'px';
+  ctxMenu.classList.add('show');
+}
+function hideCtxMenu() { ctxMenu.classList.remove('show'); ctxChat = null; }
+$('#ctxMarkReplied').onclick = () => {
+  if (ctxChat == null) { hideCtxMenu(); return; }
+  const p = peopleData.find(x => String(x.chat) === String(ctxChat));
+  if (p) {
+    markedReplied.set(p.chat, p.lastDate);
+    saveMarked();
+    peopleSig = null;            // force re-render so the row restyles immediately
+    renderList();
+  }
+  hideCtxMenu();
+};
+window.addEventListener('click', (e) => { if (!ctxMenu.contains(e.target)) hideCtxMenu(); });
+window.addEventListener('keydown', (e) => { if (e.key === 'Escape') hideCtxMenu(); });
+window.addEventListener('blur', hideCtxMenu);
+async function signOut() {
+  if (!confirm('Sign out of Basecamp? You will need to sign in again to use the app.')) return;
+  await bp.signOut();
+  if (peopleTimer) { clearInterval(peopleTimer); peopleTimer = null; }
+  current = null; peopleData = []; peopleSig = null; knownUnread = null;
+  readLocally.clear();
+  try { frame.src = 'about:blank'; } catch (e) {}
+  $('#title').textContent = 'Select a ping — the real Basecamp chat loads here';
+  $('#hint').style.display = '';
+  $('#list').innerHTML = '<div class="empty">Loading…</div>';
+  boot();
+}
+
+// After opening a ping, focus Basecamp's message box (inside the webview) so you can type right away.
+const FOCUS_JS = `(function(){var n=0;function f(){n++;var e=document.querySelector('trix-editor')||document.querySelector('[contenteditable="true"]')||document.querySelector('textarea')||document.querySelector('input[type="text"]');if(e){try{e.focus();}catch(x){}try{var s=window.getSelection(),r=document.createRange();r.selectNodeContents(e);r.collapse(false);s.removeAllRanges();s.addRange(r);}catch(x){}return;}if(n<25){setTimeout(f,150);}}f();})();`;
+frame.addEventListener('did-finish-load', () => {
+  if (!focusComposer) return;
+  focusComposer = false;
+  try { frame.focus(); } catch (e) {}
+  frame.executeJavaScript(FOCUS_JS).catch(() => {});
+});
+
+function setPoll(ms) { if (peopleTimer) clearInterval(peopleTimer); peopleTimer = setInterval(loadPeople, ms); }
+// Poll faster (and lighter) while the app is in the background so new pings auto-select promptly.
+bp.onFocusChanged(focused => {
+  if (!$('#app').classList.contains('show')) return;
+  away = !focused;
+  setPoll(focused ? POLL_FOCUSED : POLL_AWAY);
+  loadPeople();
+});
+
+boot();
+</script>
+</body>
+</html>

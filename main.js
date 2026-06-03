@@ -1,0 +1,366 @@
+// Basecamp Pings — native wrapper (Electron), OAuth2 edition.
+// No `basecamp` CLI dependency: authenticates directly via 37signals Launchpad
+// OAuth2 and calls the Basecamp API itself. Account is discovered (not hardcoded)
+// from /authorization.json. Right pane still embeds the real Basecamp chat in a
+// <webview> (sharing the same login session).
+
+const { app, BrowserWindow, ipcMain, session, shell, Notification } = require('electron');
+const path = require('path');
+const fs = require('fs');
+const http = require('http');
+
+const LAUNCHPAD = 'https://launchpad.37signals.com';
+const API_ROOT = 'https://3.basecampapi.com';
+const DEFAULT_REDIRECT = 'http://localhost:8089/oauth/callback';
+// Baked-in 37signals OAuth integration credentials. ROT19-obfuscated so the raw
+// secret doesn't show up in `strings`/`grep` of the bundle. This is OBFUSCATION,
+// NOT ENCRYPTION — trivial to reverse by anyone reading this file.
+// The strings below are the originals shifted +19 in the a–z alphabet (digits
+// untouched); rot19() reverses with the inverse shift (+7 mod 26).
+function rot19(s) {
+  return s.replace(/[a-z]/g, c => String.fromCharCode((c.charCodeAt(0) - 97 + 7) % 26 + 97));
+}
+const OAUTH = {
+  clientId: rot19('456t4707vt4905v5x649vyt66ux7u71xt2w64043'),
+  clientSecret: rot19('1u06y631644wy261377100v709u0vv86uw5475t3'),
+  redirectUri: 'http://localhost:8089/oauth/callback',
+};
+const UA = 'Basecamp Pings Native (https://decentespresso.com)';
+const PARTITION = 'persist:basecamp';   // shared by the auth window and the chat webview → one login
+const READ_PAGES = 6;
+
+let CFG_PATH, TOK_PATH;
+let config = {};   // { clientId, clientSecret, redirectUri, accountId, appHref }
+let tokens = {};   // { access_token, refresh_token, expires_at }
+let identityCache = null;
+let mainWin = null;
+
+const readJSON = p => { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch (e) { return {}; } };
+const writeJSON = (p, o) => fs.writeFileSync(p, JSON.stringify(o, null, 2));
+
+const redirectUri = () => config.redirectUri || DEFAULT_REDIRECT;
+const haveCreds = () => !!(config.clientId && config.clientSecret);
+const tokenValid = () => !!(tokens.access_token && tokens.expires_at && Date.now() < tokens.expires_at - 60000);
+
+// ---- OAuth2 ----
+function saveTokens(j) {
+  if (!j || !j.access_token) throw new Error('no access_token in response');
+  tokens = {
+    access_token: j.access_token,
+    refresh_token: j.refresh_token || tokens.refresh_token,
+    expires_at: Date.now() + ((j.expires_in || 1209600) * 1000),
+  };
+  writeJSON(TOK_PATH, tokens);
+}
+async function exchangeCode(code) {
+  const url = `${LAUNCHPAD}/authorization/token?grant_type=authorization_code`
+    + `&client_id=${encodeURIComponent(config.clientId)}`
+    + `&redirect_uri=${encodeURIComponent(redirectUri())}`
+    + `&client_secret=${encodeURIComponent(config.clientSecret)}`
+    + `&code=${encodeURIComponent(code)}`;
+  const r = await fetch(url, { method: 'POST', headers: { 'User-Agent': UA } });
+  if (!r.ok) throw new Error('token exchange failed (HTTP ' + r.status + ')');
+  saveTokens(await r.json());
+}
+async function refreshTokens() {
+  if (!tokens.refresh_token) throw new Error('not authorized');
+  const url = `${LAUNCHPAD}/authorization/token?grant_type=refresh_token`
+    + `&refresh_token=${encodeURIComponent(tokens.refresh_token)}`
+    + `&client_id=${encodeURIComponent(config.clientId)}`
+    + `&client_secret=${encodeURIComponent(config.clientSecret)}`;
+  const r = await fetch(url, { method: 'POST', headers: { 'User-Agent': UA } });
+  if (!r.ok) throw new Error('token refresh failed (HTTP ' + r.status + ')');
+  saveTokens(await r.json());
+}
+async function validToken() {
+  if (tokenValid()) return tokens.access_token;
+  await refreshTokens();
+  return tokens.access_token;
+}
+// Interactive auth: open Launchpad in the SYSTEM browser (so passkeys + an
+// existing Basecamp session work) and receive the redirect on an embedded
+// loopback HTTP server. RFC 8252 — recommended pattern for native apps.
+let activeAuth = null;   // { cancel } — lets the renderer abort an in-flight sign-in
+
+async function authInteractive() {
+  if (activeAuth) { try { activeAuth.cancel(); } catch (e) {} activeAuth = null; }
+
+  const ru = redirectUri();
+  let port = 8089, cbPath = '/oauth/callback';
+  try { const u = new URL(ru); if (u.port) port = parseInt(u.port, 10); cbPath = u.pathname || cbPath; } catch (e) {}
+
+  let server, timer, externalReject;
+  const codePromise = new Promise((resolve, reject) => {
+    externalReject = reject;
+    server = http.createServer((req, res) => {
+      const u = new URL(req.url, `http://127.0.0.1:${port}`);
+      if (u.pathname !== cbPath) { res.writeHead(404, { 'Content-Type': 'text/plain' }); res.end('not found'); return; }
+      const code = u.searchParams.get('code');
+      const errParam = u.searchParams.get('error');
+      const ok = !errParam && !!code;
+      const body = '<!doctype html><meta charset="utf-8"><title>bping</title>'
+        + '<style>body{font:14px/1.5 -apple-system,BlinkMacSystemFont,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#f6f5f3;color:#2b2926}'
+        + '.b{text-align:center;padding:28px 36px;background:#fff;border:1px solid #e3e1dd;border-radius:14px;max-width:360px}'
+        + 'h2{margin:0 0 6px}.s{color:#1b8a5a}.e{color:#b3261e}p{margin:8px 0 0;color:#6b6862}</style>'
+        + '<div class="b">'
+        + (ok
+            ? '<h2 class="s">✓ Sign-in complete</h2><p>You can close this tab and return to bping.</p>'
+            : '<h2 class="e">Sign-in failed</h2><p>' + (errParam || 'no code received') + '</p>')
+        + '</div>';
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' }); res.end(body);
+      if (ok) resolve(code); else reject(new Error(errParam || 'no code received'));
+    });
+    server.on('error', (e) => {
+      if (e && e.code === 'EADDRINUSE') reject(new Error(`Port ${port} is in use — close whatever is using it and try Connect again.`));
+      else reject(e);
+    });
+    server.listen(port, '127.0.0.1');
+    timer = setTimeout(() => reject(new Error('Sign-in timed out. Click Connect to try again.')), 10 * 60 * 1000);
+  });
+
+  activeAuth = {
+    cancel: () => {
+      try { clearTimeout(timer); } catch (e) {}
+      try { server.close(); } catch (e) {}
+      externalReject(new Error('Sign-in cancelled.'));
+    },
+  };
+
+  const authUrl = `${LAUNCHPAD}/authorization/new?response_type=code`
+    + `&client_id=${encodeURIComponent(config.clientId)}&redirect_uri=${encodeURIComponent(ru)}`;
+  try { await shell.openExternal(authUrl); }
+  catch (e) { externalReject(new Error('Could not open your default browser: ' + e.message)); }
+
+  try {
+    const code = await codePromise;
+    await exchangeCode(code);
+  } finally {
+    try { clearTimeout(timer); } catch (e) {}
+    try { server && server.close(); } catch (e) {}
+    activeAuth = null;
+  }
+}
+
+// ---- API ----
+async function bearerFetch(absUrl) {
+  const token = await validToken();
+  const opts = () => ({ headers: { Authorization: 'Bearer ' + tokens.access_token, 'User-Agent': UA, Accept: 'application/json' } });
+  let r = await fetch(absUrl, opts());
+  if (r.status === 401) { await refreshTokens(); r = await fetch(absUrl, opts()); }
+  if (!r.ok) throw new Error('API HTTP ' + r.status);
+  return r.json();
+}
+const api = p => bearerFetch(`${API_ROOT}/${config.accountId}${p}`);
+
+async function listAccounts() {
+  const j = await bearerFetch(`${LAUNCHPAD}/authorization.json`);
+  identityCache = j.identity || null;
+  const accounts = (j.accounts || [])
+    .filter(a => a.product === 'bc3')
+    .map(a => ({ id: a.id, name: a.name, href: a.href, appHref: a.app_href }));
+  return { identity: identityCache, accounts };
+}
+
+// ---- Pings (same shape as before, now via direct API) ----
+let me = null;
+async function getMe() {
+  if (me) return me;
+  const p = await api('/my/profile.json');
+  me = { id: p.id, name: p.name, avatar_url: p.avatar_url };
+  return me;
+}
+function idsFromReading(item) {
+  const m = (item.subscription_url || item.unread_url || '').match(/buckets\/(\d+)\/recordings\/(\d+)/);
+  return m ? { bucket: m[1], chat: m[2] } : null;
+}
+function personName(item, meId) {
+  const others = (item.participants || []).filter(p => p.id !== meId);
+  return others.length ? others.map(p => p.name).join(', ')
+    : (item.creator && item.creator.name) || item.bucket_name || 'Ping';
+}
+function personAvatar(item, meId) {
+  const others = (item.participants || []).filter(p => p.id !== meId);
+  return (others.length && others[0].avatar_url) || (item.creator && item.creator.avatar_url) || '';
+}
+async function buildPings(light) {
+  const m = await getMe();
+  const convos = new Map();
+  const add = (item, fromUnread) => {
+    if (item.section !== 'pings') return;
+    const ids = idsFromReading(item); if (!ids) return;
+    const unreadCount = item.unread_count || 0;
+    const unread = fromUnread || unreadCount > 0;
+    const lastDate = item.updated_at || item.created_at;
+    const prev = convos.get(ids.chat);
+    if (prev && new Date(prev.lastDate) >= new Date(lastDate) && prev.unread >= unread) return;
+    convos.set(ids.chat, {
+      bucket: ids.bucket, chat: ids.chat, name: personName(item, m.id), avatar: personAvatar(item, m.id),
+      excerpt: item.content_excerpt || '', appUrl: item.app_url || '', unread, unreadCount, lastDate,
+    });
+  };
+  const first = await api('/my/readings.json');
+  (first.unreads || []).forEach(i => add(i, true));
+  (first.reads || []).forEach(i => add(i, false));
+  for (let page = 2; page <= READ_PAGES; page++) {
+    let r; try { r = await api(`/my/readings.json?page=${page}`); } catch (e) { break; }
+    const reads = r.reads || []; reads.forEach(i => add(i, false));
+    if (reads.length < 50) break;
+  }
+  const list = [...convos.values()];
+  // /my/readings.json only reflects RECEIVED pings, so a ping you SENT does not
+  // bubble the conversation up. Correct each conversation's recency (and excerpt)
+  // from its latest line, which includes your own sent messages. Capped + parallel.
+  // Skipped in "light" mode (used for fast background polling — saves N requests).
+  if (!light) await Promise.all(list.slice(0, 50).map(async c => {
+    try {
+      const lines = await api(`/buckets/${c.bucket}/chats/${c.chat}/lines.json`);
+      const newest = Array.isArray(lines) && lines.length ? lines[0] : null;
+      if (newest && newest.created_at) {
+        if (new Date(newest.created_at) > new Date(c.lastDate)) c.lastDate = newest.created_at;
+        const txt = (newest.content || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+        if (txt) c.excerpt = txt;
+        c.lastMine = !!(newest.creator && newest.creator.id === m.id);   // did *I* send the latest line?
+        if (c.lastMine) c.excerpt = 'You: ' + c.excerpt;
+      }
+    } catch (e) { /* keep the readings values on error */ }
+  }));
+  const byDate = (a, b) => new Date(b.lastDate) - new Date(a.lastDate);
+  return { me: m, people: [...list.filter(c => c.unread).sort(byDate), ...list.filter(c => !c.unread).sort(byDate)] };
+}
+
+// ---- IPC ----
+ipcMain.handle('state:get', () => ({
+  configured: haveCreds(),
+  authed: !!tokens.access_token,
+  accountId: config.accountId || null,
+  appHref: config.appHref || null,
+  clientId: config.clientId || '',
+  redirectUri: redirectUri(),
+  defaultRedirect: DEFAULT_REDIRECT,
+}));
+ipcMain.handle('creds:save', (_e, c) => {
+  config.clientId = (c.clientId || '').trim();
+  config.clientSecret = (c.clientSecret || '').trim();
+  config.redirectUri = (c.redirectUri || '').trim() || DEFAULT_REDIRECT;
+  writeJSON(CFG_PATH, config);
+  return { ok: true };
+});
+ipcMain.handle('auth:start', async () => {
+  try { await authInteractive(); return await listAccounts(); }
+  catch (e) { return { error: e.message }; }
+});
+ipcMain.handle('auth:cancel', () => {
+  if (activeAuth) { try { activeAuth.cancel(); } catch (e) {} activeAuth = null; }
+  return { ok: true };
+});
+// Native macOS notification for a new incoming ping. Clicking it focuses the
+// app and tells the renderer which conversation to open.
+ipcMain.handle('notify:show', (_e, opts) => {
+  try {
+    if (!Notification.isSupported()) return { ok: false };
+    const n = new Notification({
+      title: (opts && opts.title) || 'bping',
+      body: (opts && opts.body) || '',
+      silent: false,
+    });
+    n.on('click', () => {
+      try {
+        if (mainWin) { mainWin.show(); mainWin.focus(); mainWin.webContents.send('notify-clicked', { chat: opts && opts.chat }); }
+      } catch (e) {}
+    });
+    n.show();
+    return { ok: true };
+  } catch (e) { return { ok: false, error: e.message }; }
+});
+ipcMain.handle('accounts:list', async () => {
+  try { return await listAccounts(); } catch (e) { return { error: e.message }; }
+});
+ipcMain.handle('account:set', (_e, a) => {
+  config.accountId = String(a.id); config.appHref = a.appHref || null;
+  writeJSON(CFG_PATH, config); me = null;
+  return { ok: true };
+});
+ipcMain.handle('pings:list', async (_e, opts) => {
+  if (!config.accountId) return { error: 'no account selected' };
+  try { return await buildPings(opts && opts.light); } catch (e) { return { error: e.message }; }
+});
+ipcMain.handle('signout', async () => {
+  tokens = {};
+  try { fs.unlinkSync(TOK_PATH); } catch (e) {}
+  config.accountId = null; config.appHref = null;
+  try { writeJSON(CFG_PATH, config); } catch (e) {}
+  me = null; identityCache = null;
+  // Clear the webview's Basecamp session too, otherwise the right pane stays logged in.
+  try { await session.fromPartition(PARTITION).clearStorageData(); } catch (e) {}
+  return { ok: true };
+});
+ipcMain.handle('open-external', (_e, url) => { if (/^https?:\/\//.test(url || '')) shell.openExternal(url); });
+ipcMain.handle('app:focused', () => !!(mainWin && mainWin.isFocused()));
+
+// ---- App ----
+function stripFraming(sess) {
+  sess.webRequest.onHeadersReceived((details, cb) => {
+    const h = details.responseHeaders || {};
+    for (const k of Object.keys(h)) {
+      const lk = k.toLowerCase();
+      if (lk === 'x-frame-options') delete h[k];
+      else if (lk === 'content-security-policy') h[k] = (Array.isArray(h[k]) ? h[k] : [h[k]]).map(v => v.replace(/frame-ancestors[^;]*;?/gi, ''));
+    }
+    cb({ responseHeaders: h });
+  });
+}
+// When the user sends a ping in the embedded Basecamp <webview>, we don't run
+// that POST ourselves — but it travels through this session's network layer.
+// Tap into it and push a 'message-sent' notification to the renderer so the
+// pings list refreshes right away (instead of waiting for the next poll).
+function watchForSends(sess) {
+  sess.webRequest.onCompleted({ urls: ['https://*.basecamp.com/*', 'https://*.basecampapi.com/*'] }, (details) => {
+    if (details.method !== 'POST') return;
+    if (!/\/chats?\/[^/]+\/lines(\.json)?(\?|$)/.test(details.url)) return;
+    const sc = details.statusCode;
+    if (sc < 200 || sc >= 400) return;
+    if (mainWin && !mainWin.isDestroyed()) mainWin.webContents.send('message-sent');
+  });
+}
+
+function createWindow() {
+  stripFraming(session.fromPartition(PARTITION));
+  stripFraming(session.defaultSession);
+  watchForSends(session.fromPartition(PARTITION));
+  mainWin = new BrowserWindow({
+    width: 1240, height: 840, title: 'Basecamp Pings — Native',
+    webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, webviewTag: true },
+  });
+  mainWin.loadFile(path.join(__dirname, 'renderer', 'index.html'));
+  mainWin.on('focus', () => mainWin.webContents.send('focus-changed', true));
+  mainWin.on('blur', () => mainWin.webContents.send('focus-changed', false));
+}
+
+// Links clicked in the chat <webview> open in the system browser — both external
+// links and Basecamp links. Opening a ping uses webview.src (a programmatic load),
+// which does NOT fire will-navigate, so the selected conversation still loads in
+// the pane; only user-clicked links are intercepted here.
+app.on('web-contents-created', (_e, contents) => {
+  if (contents.getType() !== 'webview') return;
+  contents.setWindowOpenHandler(({ url }) => {            // target=_blank / popups
+    if (/^https?:\/\//i.test(url)) shell.openExternal(url);
+    return { action: 'deny' };
+  });
+  contents.on('will-navigate', (ev, url) => {             // any user-clicked link
+    if (/^https?:\/\//i.test(url)) { ev.preventDefault(); shell.openExternal(url); }
+  });
+});
+
+app.whenReady().then(() => {
+  CFG_PATH = path.join(app.getPath('userData'), 'config.json');
+  TOK_PATH = path.join(app.getPath('userData'), 'tokens.json');
+  config = readJSON(CFG_PATH);   // preserves accountId/appHref across launches
+  tokens = readJSON(TOK_PATH);
+  // Force baked-in OAuth credentials on every launch (overrides anything saved).
+  config.clientId = OAUTH.clientId;
+  config.clientSecret = OAUTH.clientSecret;
+  config.redirectUri = OAUTH.redirectUri;
+  createWindow();
+});
+app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
+app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
