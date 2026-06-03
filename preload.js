@@ -21,4 +21,5 @@ contextBridge.exposeInMainWorld('bping', {
   listPeople: () => ipcRenderer.invoke('people:list'),
   sendLine: (bucket, chat, html) => ipcRenderer.invoke('api:send-line', { bucket, chat, html }),
   writeClipboard: (text, html) => ipcRenderer.invoke('clipboard:write', { text, html }),
+  fetchAttachment: (url, maxBytes) => ipcRenderer.invoke('attachment:fetch', { url, maxBytes }),
 });

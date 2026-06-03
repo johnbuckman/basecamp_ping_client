@@ -659,19 +659,36 @@ function attachmentHref(line, att) {
   return line.app_url || att.url || att.download_url || '';
 }
 
+function isImageAttachment(att) {
+  return /^image\//i.test((att && att.content_type) || '');
+}
+
 // HTML body of a single line — text content, attachments, or both.
 // Used for both Forward and Copy. Attachment-only lines (Chat::Lines::Upload)
 // have content==null and a populated attachments[]; render each attachment
 // as a clickable filename so the recipient can view the original.
-function lineBodyHtml(line) {
+//
+// opts.embedImages — when true (Copy), images with a pre-fetched _dataUri
+// are inlined as <img src="data:..."> so pasting into Mail/Notes shows the
+// real image. Falls back to the filename link if no data URI (download
+// failed, file too big, or non-image). Forward leaves this off because
+// Basecamp's chat-line HTML strips <img>.
+function lineBodyHtml(line, opts) {
+  const embedImages = !!(opts && opts.embedImages);
   const parts = [];
   if (line.content) parts.push(cleanForwardHtml(line.content));
   for (const a of (line.attachments || [])) {
     const label = esc(attachmentLabel(a));
     const href = attachmentHref(line, a);
-    parts.push(href
+    const link = href
       ? `<div>📎 <a href="${esc(href)}">${label}</a></div>`
-      : `<div>📎 ${label}</div>`);
+      : `<div>📎 ${label}</div>`;
+    if (embedImages && isImageAttachment(a) && a._dataUri) {
+      // Image inlined for paste; link below as a fallback/caption.
+      parts.push(`<div><img src="${a._dataUri}" alt="${label}" style="max-width:640px;height:auto;display:block;"></div>${link}`);
+    } else {
+      parts.push(link);
+    }
   }
   return parts.join('');
 }
@@ -705,12 +722,12 @@ function fwdHeaderHtml(creator) {
 //   - Blocks (header+blockquote or bare blockquote when the author repeats)
 //     are joined by <div><br></div> to put a blank line between each
 //     forwarded comment.
-function composeForwardHtml(lines) {
+function composeForwardHtml(lines, opts) {
   const blocks = [];
   let lastCreatorId = null;
   for (const l of lines) {
     const c = l.creator || {};
-    const body = lineBodyHtml(l);
+    const body = lineBodyHtml(l, opts);
     if (!body) continue;   // genuinely-empty line — defensive, shouldn't happen
     let block = '';
     if (c.id !== lastCreatorId) {
@@ -812,11 +829,41 @@ function composeCopyText(lines) {
 async function runCopy() {
   if (fwdSending || !fwdLines.length) return;
   fwdSending = true;
-  // Compose rich-text (same shape as forward) and plain-text versions —
-  // both group consecutive same-author comments under one header and quote
-  // each body so the reader sees at a glance what was lifted.
-  const html = composeForwardHtml(fwdLines);
+
+  // Pre-fetch every image attachment so it can be inlined as a data URI in
+  // the clipboard HTML. Pasting into Mail / Notes / rich text editors will
+  // then render the image directly, without needing Basecamp cookies on the
+  // paste target. Non-image attachments stay as filename links.
+  const MAX_BYTES_PER_IMAGE = 5 * 1024 * 1024;   // 5 MB cap per image
+  const imgs = [];
+  for (const l of fwdLines) {
+    for (const a of (l.attachments || [])) {
+      if (isImageAttachment(a) && a.download_url) imgs.push(a);
+    }
+  }
+  if (imgs.length) {
+    setFwdStatus(`Downloading ${imgs.length} image${imgs.length === 1 ? '' : 's'}…`);
+    let done = 0, i = 0;
+    const CONCURRENCY = 4;
+    async function worker() {
+      while (i < imgs.length) {
+        const a = imgs[i++];
+        try {
+          const fr = await bp.fetchAttachment(a.download_url, MAX_BYTES_PER_IMAGE);
+          if (fr && fr.ok) a._dataUri = `data:${fr.mime};base64,${fr.base64}`;
+        } catch (e) { /* fall through to link */ }
+        done++;
+        setFwdStatus(`Downloading ${done}/${imgs.length} image${imgs.length === 1 ? '' : 's'}…`);
+      }
+    }
+    await Promise.all(Array.from({ length: CONCURRENCY }, worker));
+  }
+
+  // HTML inlines images (embedImages: true). Plain text always falls back to
+  // the filename + URL since text clipboards can't hold image data.
+  const html = composeForwardHtml(fwdLines, { embedImages: true });
   const text = composeCopyText(fwdLines);
+  setFwdStatus('Writing to clipboard…');
   let cw;
   try { cw = await bp.writeClipboard(text, html); }
   catch (e) { setFwdStatus('Copy failed: ' + e.message); fwdSending = false; return; }

@@ -245,6 +245,49 @@ async function unbookmarkUrl(bookmarkUrl) {
   } catch (e) { return false; }
 }
 
+// Fetch a Basecamp attachment as a base64 data URI. Used by the Copy feature
+// to inline images into the clipboard HTML so that pasting into Mail / Notes /
+// rich text editors renders the image inline (no Basecamp login needed by the
+// paste target).
+//
+// Follows redirects manually because the bearer token MUST be dropped on the
+// `*.basecampapi.com` → `storage.basecamp.com` hop (S3 returns
+// `objectNameNotDecodedYet` if we forward the bearer). The Location string is
+// used as-is — running it through `new URL().toString()` re-encodes the
+// signed-URL query and breaks the signature.
+async function fetchAttachmentDataUri(url, maxBytes) {
+  const allowed = /^https:\/\/([a-z0-9-]+\.basecampapi\.com|[a-z0-9-]+\.basecamp-static\.com|preview\.app\.basecamp\.com|storage\.basecamp\.com)\//i;
+  if (!allowed.test(url)) return null;
+  await validToken();
+  async function attempt() {
+    let current = url;
+    for (let hops = 0; hops < 4; hops++) {
+      const isApi = /^https:\/\/[a-z0-9-]+\.basecampapi\.com\//i.test(current);
+      const headers = { 'User-Agent': UA };
+      if (isApi) headers.Authorization = 'Bearer ' + tokens.access_token;
+      const r = await fetch(current, { method: 'GET', headers, redirect: 'manual' });
+      if (r.status >= 300 && r.status < 400) {
+        const loc = r.headers.get('location');
+        if (!loc) return null;
+        current = loc;        // raw string — don't re-parse, would break the S3 signature
+        continue;
+      }
+      return r;
+    }
+    return null;
+  }
+  let r = await attempt();
+  if (r && r.status === 401) { await refreshTokens(); r = await attempt(); }
+  if (!r || !r.ok) return null;
+  const cl = parseInt(r.headers.get('content-length') || '0', 10);
+  if (maxBytes && cl && cl > maxBytes) return null;
+  const ab = await r.arrayBuffer();
+  const buf = Buffer.from(ab);
+  if (maxBytes && buf.length > maxBytes) return null;
+  const mime = (r.headers.get('content-type') || 'application/octet-stream').split(';')[0].trim();
+  return { mime, base64: buf.toString('base64'), bytes: buf.length };
+}
+
 async function sendChatLine(bucket, chat, html) {
   const r = await apiSend(`/buckets/${bucket}/chats/${chat}/lines.json`,
     'POST', { content: html, content_type: 'text/html' });
@@ -439,6 +482,14 @@ ipcMain.handle('api:send-line', async (_e, { bucket, chat, html } = {}) => {
   if (!bucket || !chat || !html) return { error: 'missing bucket/chat/html' };
   try { const line = await sendChatLine(bucket, chat, html); return { ok: true, line }; }
   catch (e) { return { error: e.message }; }
+});
+ipcMain.handle('attachment:fetch', async (_e, { url, maxBytes } = {}) => {
+  if (!url) return { error: 'no url' };
+  try {
+    const r = await fetchAttachmentDataUri(url, maxBytes || 0);
+    if (!r) return { error: 'fetch failed or too large' };
+    return { ok: true, mime: r.mime, base64: r.base64, bytes: r.bytes };
+  } catch (e) { return { error: e.message }; }
 });
 ipcMain.handle('clipboard:write', (_e, { text, html } = {}) => {
   try {
