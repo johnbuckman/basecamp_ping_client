@@ -12,12 +12,15 @@
 # - Removes any prior bping-v*.dmg (and any unversioned legacy bping.dmg) from
 #   the build dir and deploy targets, so only one DMG of each kind is kept.
 # - Deploys app + new DMG to ~/Documents/bping-apps/ and ~/Desktop/.
+# - Quits any running bping, installs the new .app into /Applications, and
+#   relaunches it (so the running version always matches the latest build).
 #
 # Env overrides:
 #   BPING_SIGN_ID         — codesign identity (default: Developer ID Application: Vid Tadel ...)
 #   BPING_NOTARY_PROFILE  — notarytool keychain profile name (default: bping-notary)
 #   BPING_NOTARIZE=1      — submit to Apple notary + staple (default: skip)
 #   BPING_SKIP_BUMP=1     — don't bump the version (rebuild current version)
+#   BPING_SKIP_INSTALL=1  — don't quit/install/relaunch into /Applications
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
@@ -152,3 +155,38 @@ done
 echo "==> built: $NEW_BASENAME ($(du -h "$DMG" | awk '{print $1}'))"
 echo "==> version: $NEW_VER"
 echo "==> deployed to: ~/Documents/bping-apps/ and ~/Desktop/"
+
+# --- Install to /Applications + relaunch -----------------------------------
+# Always replace the running instance so the user sees the new build immediately.
+# Skip with BPING_SKIP_INSTALL=1 if you want to test from a DMG copy first.
+if [ "${BPING_SKIP_INSTALL:-0}" = "1" ]; then
+  echo "==> Skipping /Applications install (BPING_SKIP_INSTALL=1)."
+else
+  WAS_RUNNING=0
+  if pgrep -x bping >/dev/null 2>&1; then
+    WAS_RUNNING=1
+    echo "==> Quitting running bping"
+    osascript -e 'tell application "bping" to quit' >/dev/null 2>&1 || true
+    # Give it up to 4 seconds to quit cleanly, then force.
+    for i in 1 2 3 4; do
+      pgrep -x bping >/dev/null 2>&1 || break
+      sleep 1
+    done
+    if pgrep -x bping >/dev/null 2>&1; then
+      echo "==> Forcing bping quit"
+      killall -9 bping 2>/dev/null || true
+      sleep 1
+    fi
+  fi
+  echo "==> Installing to /Applications/bping.app"
+  rm -rf /Applications/bping.app
+  cp -R "$APP" /Applications/
+  touch /Applications/bping.app
+  echo "==> Relaunching /Applications/bping.app"
+  open /Applications/bping.app
+  if [ "$WAS_RUNNING" = "1" ]; then
+    echo "==> Replaced the running instance — new build is live."
+  else
+    echo "==> Launched new build (no prior instance was running)."
+  fi
+fi

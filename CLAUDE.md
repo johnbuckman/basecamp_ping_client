@@ -43,6 +43,13 @@ BPING_SKIP_BUMP=1 ./build-dmg.sh
 a separate step. Older `bping-v*.dmg` files are removed from `dist/`,
 `~/Documents/bping-apps/`, and `~/Desktop/` on each successful build.
 
+**Auto-install + relaunch:** every build also quits any running bping, copies the
+new `.app` into `/Applications/bping.app` (replacing the prior one), and
+relaunches it. Skip with `BPING_SKIP_INSTALL=1 ./build-dmg.sh` if you want to
+test from a DMG copy without disturbing the currently-running instance. User
+data (OAuth tokens, settings, marked-replied state) lives in `~/Library/Application Support/bping/`
+and `localStorage` — replacing the `.app` doesn't touch any of it.
+
 After a notarized `build-dmg.sh` succeeds, `spctl --assess` returns
 `accepted source=Notarized Developer ID`. Recipients double-click the DMG, drag
 to Applications, no Gatekeeper warning, no right-click-to-open.
