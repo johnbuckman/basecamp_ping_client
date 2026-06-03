@@ -161,66 +161,6 @@ async function listAccounts() {
   return { identity: identityCache, accounts };
 }
 
-// POST/PUT with bearer + retry-once on 401 (mirror of bearerFetch for non-GET).
-async function bearerSend(absUrl, method, body) {
-  await validToken();
-  const opts = () => ({
-    method,
-    headers: {
-      Authorization: 'Bearer ' + tokens.access_token,
-      'User-Agent': UA,
-      'Content-Type': 'application/json',
-      Accept: 'application/json',
-    },
-    body: body != null ? JSON.stringify(body) : undefined,
-  });
-  let r = await fetch(absUrl, opts());
-  if (r.status === 401) { await refreshTokens(); r = await fetch(absUrl, opts()); }
-  if (!r.ok) throw new Error('API HTTP ' + r.status);
-  const text = await r.text();
-  try { return JSON.parse(text); } catch (e) { return { ok: true }; }
-}
-
-// Used by Forward to send a rich-text line to any chat we know the ids of.
-function sendChatLine(bucket, chat, html) {
-  return bearerSend(
-    `${API_ROOT}/${config.accountId}/buckets/${bucket}/chats/${chat}/lines.json`,
-    'POST',
-    { content: html, content_type: 'text/html' }
-  );
-}
-
-// Cached pingable-people roster (account-wide). Fetched on first /api/people:list
-// call from the renderer (for the Forward dialog's typeahead), then served from
-// memory until the cache TTL elapses or the user signs out.
-let peopleCache = null;
-let peopleCacheAt = 0;
-const PEOPLE_TTL_MS = 25 * 60 * 1000;
-async function fetchAllPeople() {
-  if (peopleCache && Date.now() - peopleCacheAt < PEOPLE_TTL_MS) return peopleCache;
-  const all = [];
-  // Basecamp returns 50/page. Cap at 40 pages (2000 people) as a safety stop.
-  for (let page = 1; page <= 40; page++) {
-    let chunk;
-    try { chunk = await api(`/people.json?page=${page}`); }
-    catch (e) { break; }
-    if (!Array.isArray(chunk) || chunk.length === 0) break;
-    for (const p of chunk) {
-      if (!p.can_ping) continue;
-      all.push({
-        id: p.id,
-        name: p.name || '(no name)',
-        email: p.email_address || '',
-        avatar: p.avatar_url || '',
-      });
-    }
-    if (chunk.length < 50) break;
-  }
-  peopleCache = all;
-  peopleCacheAt = Date.now();
-  return peopleCache;
-}
-
 // ---- Pings (same shape as before, now via direct API) ----
 let me = null;
 async function getMe() {
@@ -350,24 +290,9 @@ ipcMain.handle('signout', async () => {
   config.accountId = null; config.appHref = null;
   try { writeJSON(CFG_PATH, config); } catch (e) {}
   me = null; identityCache = null;
-  peopleCache = null; peopleCacheAt = 0;
   // Clear the webview's Basecamp session too, otherwise the right pane stays logged in.
   try { await session.fromPartition(PARTITION).clearStorageData(); } catch (e) {}
   return { ok: true };
-});
-// Full pingable-people roster for the Forward dialog's typeahead.
-ipcMain.handle('people:list', async () => {
-  if (!config.accountId) return { error: 'no account' };
-  try { return await fetchAllPeople(); } catch (e) { return { error: e.message }; }
-});
-// Send a rich-text line to a chat — used by Forward to deliver the message.
-ipcMain.handle('api:send-line', async (_e, opts) => {
-  const bucket = opts && opts.bucket, chat = opts && opts.chat, html = opts && opts.html;
-  if (!INT.test(String(bucket)) || !INT.test(String(chat))) return { error: 'bad ids' };
-  if (typeof html !== 'string' || !html.trim()) return { error: 'empty message' };
-  if (!config.accountId) return { error: 'no account' };
-  try { await sendChatLine(bucket, chat, html); return { ok: true }; }
-  catch (e) { return { error: e.message }; }
 });
 ipcMain.handle('open-external', (_e, url) => { if (/^https?:\/\//.test(url || '')) shell.openExternal(url); });
 ipcMain.handle('app:focused', () => !!(mainWin && mainWin.isFocused()));
