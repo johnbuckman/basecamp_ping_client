@@ -288,6 +288,65 @@ async function fetchAttachmentDataUri(url, maxBytes) {
   return { mime, base64: buf.toString('base64'), bytes: buf.length };
 }
 
+// --- Notes destination (Tmp project) ---------------------------------------
+// The Copy feature also stashes each copy as a fresh document in the user's
+// "Tmp" project for archival / quick access. The project's bucket + vault
+// IDs are looked up by name on first use and cached in memory (cleared on
+// signout / next process start).
+let tmpProjectCache = null;     // { bucketId, vaultId, appUrl }
+async function findTmpProject() {
+  if (tmpProjectCache) return tmpProjectCache;
+  for (let page = 1; page <= 10; page++) {
+    let p; try { p = await api(`/projects.json?page=${page}`); } catch (e) { break; }
+    if (!Array.isArray(p) || !p.length) break;
+    for (const proj of p) {
+      if (proj.name && proj.name.trim().toLowerCase() === 'tmp') {
+        const vault = (proj.dock || []).find(d => d.name === 'vault');
+        if (!vault) throw new Error('Tmp project has no Docs & Files vault');
+        tmpProjectCache = { bucketId: proj.id, vaultId: vault.id, appUrl: proj.app_url };
+        return tmpProjectCache;
+      }
+    }
+    if (p.length < 15) break;
+  }
+  throw new Error('No project named "Tmp" — create one in Basecamp first.');
+}
+
+// Create a published (status:active) document in the Tmp project's vault.
+// status:active is critical — without it the doc is created as a draft and
+// the user won't see it (per bc3-api/sections/documents.md).
+async function createCopyDoc(title, content) {
+  const tmp = await findTmpProject();
+  const r = await apiSend(`/buckets/${tmp.bucketId}/vaults/${tmp.vaultId}/documents.json`,
+    'POST', { title, content, status: 'active' });
+  if (!r.ok) {
+    const txt = await r.text().catch(() => '');
+    throw new Error('create doc HTTP ' + r.status + (txt ? ' — ' + txt.slice(0, 200) : ''));
+  }
+  return await r.json();
+}
+
+// Open a Basecamp URL in a new top-level Electron window, sharing the same
+// persist:basecamp session as the main window's chat webview so the user is
+// already logged in. Top-level navigation doesn't need the X-Frame-Options
+// stripping the embedded webview does.
+function openBasecampWindow(url) {
+  if (!url || !/^https?:\/\//.test(url)) return null;
+  const win = new BrowserWindow({
+    width: 1100,
+    height: 800,
+    title: 'Basecamp',
+    webPreferences: {
+      session: session.fromPartition(PARTITION),
+      sandbox: true,
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  });
+  win.loadURL(url);
+  return win;
+}
+
 async function sendChatLine(bucket, chat, html) {
   const r = await apiSend(`/buckets/${bucket}/chats/${chat}/lines.json`,
     'POST', { content: html, content_type: 'text/html' });
@@ -452,6 +511,7 @@ ipcMain.handle('signout', async () => {
   try { writeJSON(CFG_PATH, config); } catch (e) {}
   me = null; identityCache = null;
   peopleCache = { at: 0, list: [] };
+  tmpProjectCache = null;
   // Clear the webview's Basecamp session too, otherwise the right pane stays logged in.
   try { await session.fromPartition(PARTITION).clearStorageData(); } catch (e) {}
   return { ok: true };
@@ -482,6 +542,18 @@ ipcMain.handle('api:send-line', async (_e, { bucket, chat, html } = {}) => {
   if (!bucket || !chat || !html) return { error: 'missing bucket/chat/html' };
   try { const line = await sendChatLine(bucket, chat, html); return { ok: true, line }; }
   catch (e) { return { error: e.message }; }
+});
+ipcMain.handle('notes:write', async (_e, { title, content } = {}) => {
+  if (!config.accountId) return { error: 'no account selected' };
+  if (!title || !content) return { error: 'missing title/content' };
+  try {
+    const doc = await createCopyDoc(title, content);
+    return { ok: true, app_url: doc.app_url, id: doc.id, title: doc.title };
+  } catch (e) { return { error: e.message }; }
+});
+ipcMain.handle('window:open-basecamp', (_e, { url } = {}) => {
+  try { openBasecampWindow(url); return { ok: true }; }
+  catch (e) { return { ok: false, error: e.message }; }
 });
 ipcMain.handle('attachment:fetch', async (_e, { url, maxBytes } = {}) => {
   if (!url) return { error: 'no url' };

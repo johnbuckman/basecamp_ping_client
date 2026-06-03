@@ -22,4 +22,6 @@ contextBridge.exposeInMainWorld('bping', {
   sendLine: (bucket, chat, html) => ipcRenderer.invoke('api:send-line', { bucket, chat, html }),
   writeClipboard: (text, html) => ipcRenderer.invoke('clipboard:write', { text, html }),
   fetchAttachment: (url, maxBytes) => ipcRenderer.invoke('attachment:fetch', { url, maxBytes }),
+  saveCopyToNotes: (title, content) => ipcRenderer.invoke('notes:write', { title, content }),
+  openBasecampWindow: (url) => ipcRenderer.invoke('window:open-basecamp', { url }),
 });

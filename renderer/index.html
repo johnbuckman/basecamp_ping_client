@@ -863,6 +863,11 @@ async function runCopy() {
   // the filename + URL since text clipboards can't hold image data.
   const html = composeForwardHtml(fwdLines, { embedImages: true });
   const text = composeCopyText(fwdLines);
+  // Doc copy: Basecamp doc content allows rich text but not data: URIs in
+  // <img src> (it sanitizes attachments to its own bc-attachment scheme), so
+  // we save the link-only variant — same shape as Forward. Image data stays
+  // on the clipboard for the user to paste elsewhere.
+  const docHtml = composeForwardHtml(fwdLines);
   setFwdStatus('Writing to clipboard…');
   let cw;
   try { cw = await bp.writeClipboard(text, html); }
@@ -872,6 +877,18 @@ async function runCopy() {
     fwdSending = false;
     return;
   }
+  // Save a copy as a new published doc in the Tmp project — gives the user a
+  // browsable archive of every Copy run. Title is the source chat + a
+  // local-time stamp so it's easy to spot. If the save fails we still
+  // succeeded at the clipboard write, so report the partial outcome.
+  const docTitle = `From ${current.name} — ${nowStamp()}`;
+  setFwdStatus(`Saving to Tmp as "${docTitle}"…`);
+  let nr;
+  try { nr = await bp.saveCopyToNotes(docTitle, docHtml); }
+  catch (e) { nr = { error: e.message }; }
+  const docOk  = !!(nr && nr.ok && nr.app_url);
+  const docUrl = docOk ? nr.app_url : '';
+
   // Auto-DELETE each bookmark.
   let removed = 0, kept = 0;
   for (const l of fwdLines) {
@@ -879,12 +896,25 @@ async function runCopy() {
     if (dr && dr.ok) removed++; else kept++;
   }
   const n = fwdLines.length;
-  if (kept === 0) {
-    setFwdStatus(`Copied ${n} bookmarked message${n === 1 ? '' : 's'} to the clipboard. Bookmarks cleared.`, true);
+  const bmNote = kept === 0
+    ? 'Bookmarks cleared.'
+    : `${kept} bookmark${kept === 1 ? '' : 's'} couldn't be auto-removed — un-bookmark in Basecamp manually.`;
+  if (docOk) {
+    setFwdStatus(`Copied ${n} message${n === 1 ? '' : 's'} to clipboard. Saved to Tmp: ${docTitle}. ${bmNote}`, true);
+    // Pop a new bping window with Basecamp pointed at the freshly-created doc,
+    // sharing the same webview session so it's already logged in.
+    bp.openBasecampWindow(docUrl);
   } else {
-    setFwdStatus(`Copied ${n} message${n === 1 ? '' : 's'} to the clipboard. ${kept} bookmark${kept === 1 ? '' : 's'} couldn't be auto-removed — un-bookmark in Basecamp manually.`, true);
+    setFwdStatus(`Copied ${n} message${n === 1 ? '' : 's'} to clipboard, but couldn't save to Tmp: ${(nr && nr.error) || 'unknown'}. ${bmNote}`, true);
   }
-  setTimeout(closeForward, 2000);
+  setTimeout(closeForward, 2400);
+}
+
+// Local-timezone "YYYY-MM-DD HH:MM" stamp for the saved doc title.
+function nowStamp() {
+  const d = new Date();
+  const pad = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
 $('#forwardBtn').onclick = openForward;
