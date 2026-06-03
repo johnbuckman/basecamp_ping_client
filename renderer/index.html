@@ -667,26 +667,31 @@ function isImageAttachment(att) {
 // Used for both Forward and Copy. Attachment-only lines (Chat::Lines::Upload)
 // have content==null and a populated attachments[].
 //
-// opts.bcAttachments — when true (Copy), each attachment with a pre-fetched
-// _sgid is rendered as <bc-attachment sgid="..."> so pasting into another
-// Basecamp document/comment embeds the file inline with Basecamp's native
-// preview (image thumbnails, file pills). Falls back to a filename link if
-// the re-upload didn't succeed. Forward leaves this off because chat lines
-// reject bc-attachment with HTTP 422.
+// opts.inlineImages — when true (Copy), image attachments are rendered as a
+// direct <img src="<preview-url>"> using the original Basecamp preview URL.
+// When pasted into another Basecamp doc/comment, the user's browser session
+// (logged into Basecamp) fetches the image directly. Non-image attachments
+// stay as filename links. Forward leaves this off — chat lines don't render
+// arbitrary <img> tags.
 function lineBodyHtml(line, opts) {
-  const bcAttachments = !!(opts && opts.bcAttachments);
+  const inlineImages = !!(opts && opts.inlineImages);
   const parts = [];
   if (line.content) parts.push(cleanForwardHtml(line.content));
   for (const a of (line.attachments || [])) {
-    if (bcAttachments && a._sgid) {
-      parts.push(`<bc-attachment sgid="${esc(a._sgid)}"></bc-attachment>`);
-      continue;
-    }
     const label = esc(attachmentLabel(a));
     const href = attachmentHref(line, a);
-    parts.push(href
-      ? `<div>📎 <a href="${esc(href)}">${label}</a></div>`
-      : `<div>📎 ${label}</div>`);
+    if (inlineImages && isImageAttachment(a) && a.url) {
+      // <img> with the original preview URL. The link stays below as a
+      // caption / fallback in case the renderer doesn't show the image.
+      parts.push(
+        `<div><img src="${esc(a.url)}" alt="${label}" style="max-width:640px;height:auto;display:block;"></div>` +
+        (href ? `<div>📎 <a href="${esc(href)}">${label}</a></div>` : '')
+      );
+    } else {
+      parts.push(href
+        ? `<div>📎 <a href="${esc(href)}">${label}</a></div>`
+        : `<div>📎 ${label}</div>`);
+    }
   }
   return parts.join('');
 }
@@ -828,44 +833,12 @@ async function runCopy() {
   if (fwdSending || !fwdLines.length) return;
   fwdSending = true;
 
-  // Re-upload every attachment so it has its own Basecamp Attachment sgid.
-  // We assume the user is only pasting into Basecamp surfaces (docs,
-  // messages, comments), so embedding <bc-attachment sgid="..."> gives a
-  // proper inline preview — far better than the data-URI approach we used
-  // before (which only worked in Mail/Notes and got stripped by Basecamp).
-  //
-  // 5 MB per-file cap keeps the round trip snappy; failed re-uploads fall
-  // through to a filename link in the composer.
-  const MAX_BYTES = 5 * 1024 * 1024;
-  const atts = [];
-  for (const l of fwdLines) {
-    for (const a of (l.attachments || [])) {
-      if (a && a.download_url) atts.push(a);
-    }
-  }
-  if (atts.length) {
-    setFwdStatus(`Re-uploading ${atts.length} attachment${atts.length === 1 ? '' : 's'} (download + upload)…`);
-    let done = 0, i = 0;
-    const CONCURRENCY = 4;
-    async function worker() {
-      while (i < atts.length) {
-        const a = atts[i++];
-        try {
-          const r = await bp.reuploadAttachment(
-            a.download_url, a.filename || a.title || 'attachment', a.content_type, MAX_BYTES);
-          if (r && r.ok && r.sgid) a._sgid = r.sgid;
-        } catch (e) { /* fall through to link */ }
-        done++;
-        setFwdStatus(`Re-uploading ${done}/${atts.length} attachment${atts.length === 1 ? '' : 's'}…`);
-      }
-    }
-    await Promise.all(Array.from({ length: CONCURRENCY }, worker));
-  }
-
-  // HTML embeds attachments as <bc-attachment sgid="..."> (paste-into-Basecamp
-  // friendly). Plain text always lists filename + URL since text clipboards
-  // can't hold attachment data.
-  const html = composeForwardHtml(fwdLines, { bcAttachments: true });
+  // Images use the original Basecamp preview URL directly (<img src="...">).
+  // When the user pastes into another Basecamp surface, their logged-in
+  // browser session fetches the image from preview.app.basecamp.com itself,
+  // so no re-upload / sgid minting is needed. Non-image attachments are kept
+  // as filename links because there's no inline equivalent for them.
+  const html = composeForwardHtml(fwdLines, { inlineImages: true });
   const text = composeCopyText(fwdLines);
   setFwdStatus('Writing to clipboard…');
   let cw;
@@ -884,18 +857,14 @@ async function runCopy() {
     if (dr && dr.ok) removed++; else kept++;
   }
   const n = fwdLines.length;
-  const attMissing = atts.length - atts.filter(a => a._sgid).length;
-  const attNote = atts.length === 0
-    ? ''
-    : (attMissing === 0
-        ? ` (incl. ${atts.length} attachment${atts.length === 1 ? '' : 's'})`
-        : ` (${atts.length - attMissing}/${atts.length} attachments embedded; ${attMissing} fell back to links)`);
+  const totalAtts = fwdLines.reduce((s, l) => s + ((l.attachments || []).length), 0);
+  const attNote = totalAtts ? ` (incl. ${totalAtts} attachment${totalAtts === 1 ? '' : 's'})` : '';
   if (kept === 0) {
     setFwdStatus(`Copied ${n} message${n === 1 ? '' : 's'} to clipboard${attNote}. Bookmarks cleared.`, true);
   } else {
     setFwdStatus(`Copied ${n} message${n === 1 ? '' : 's'} to clipboard${attNote}. ${kept} bookmark${kept === 1 ? '' : 's'} couldn't be auto-removed — un-bookmark in Basecamp manually.`, true);
   }
-  setTimeout(closeForward, 2200);
+  setTimeout(closeForward, 2000);
 }
 
 $('#forwardBtn').onclick = openForward;
