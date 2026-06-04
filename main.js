@@ -590,12 +590,24 @@ function createWindow() {
 //
 // EXCEPTION: the login flow MUST stay in the webview, otherwise its session
 // cookies land in the wrong place (the system browser instead of
-// persist:basecamp). Previously, when a fresh user clicked "Sign in with
-// Google" on Launchpad's form, will-navigate killed the POST and re-opened
-// the URL in the system browser as a bare GET → Launchpad 404'd
-// (`/google_sign_in/authorization` requires the form POST). So we whitelist
-// Launchpad + the OAuth providers Launchpad supports.
+// persist:basecamp). Two parts:
+//
+//   1) Navigations TO auth hosts (Launchpad, Google, Apple, etc.) — these
+//      are the form submits and OAuth steps. Stay in-webview.
+//   2) Navigations FROM an auth host TO Basecamp — this is the post-login
+//      redirect. Launchpad's "Logging you in…" page does a
+//      `window.location = "https://3.basecamp.com/<acct>"` once auth
+//      completes; that fires will-navigate with a basecamp.com URL. We
+//      need to let it through, otherwise the webview is stuck forever on
+//      the loading screen while the real session lands in the system
+//      browser instead of persist:basecamp.
+//
+// Everything else — user-clicked Basecamp/external links in chat content
+// once you're already in the app — still gets diverted to the system
+// browser, preserving the original UX (the sidebar drives in-pane
+// navigation; chat links pop out so they don't blow away the conversation).
 const AUTH_HOSTS = /^https:\/\/(launchpad\.37signals\.com|accounts\.google\.com|appleid\.apple\.com|login\.microsoftonline\.com|login\.live\.com|github\.com)\//i;
+const BASECAMP_UI_HOSTS = /^https:\/\/([a-z0-9-]+\.)?basecamp\.com\//i;
 
 app.on('web-contents-created', (_e, contents) => {
   if (contents.getType() !== 'webview') return;
@@ -606,6 +618,9 @@ app.on('web-contents-created', (_e, contents) => {
   });
   contents.on('will-navigate', (ev, url) => {             // any user-clicked link / form submit
     if (AUTH_HOSTS.test(url)) return;                     // login flow stays in the webview
+    const current = contents.getURL() || '';
+    // Post-login redirect from Launchpad's "Logging you in…" → Basecamp app.
+    if (AUTH_HOSTS.test(current) && BASECAMP_UI_HOSTS.test(url)) return;
     if (/^https?:\/\//i.test(url)) { ev.preventDefault(); shell.openExternal(url); }
   });
 });
