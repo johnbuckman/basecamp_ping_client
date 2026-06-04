@@ -481,14 +481,46 @@ ipcMain.handle('pings:list', async (_e, opts) => {
   try { return await buildPings(opts && opts.light); } catch (e) { return { error: e.message }; }
 });
 ipcMain.handle('signout', async () => {
+  // --- LEFT PANE: clear OAuth + per-account state (API access) ---
   tokens = {};
   try { fs.unlinkSync(TOK_PATH); } catch (e) {}
   config.accountId = null; config.appHref = null;
   try { writeJSON(CFG_PATH, config); } catch (e) {}
   me = null; identityCache = null;
   peopleCache = { at: 0, list: [] };
-  // Clear the webview's Basecamp session too, otherwise the right pane stays logged in.
-  try { await session.fromPartition(PARTITION).clearStorageData(); } catch (e) {}
+
+  // --- RIGHT PANE: wipe everything tied to the Basecamp webview session ---
+  // A bare clearStorageData() turned out to leave the user logged in if any
+  // Basecamp page was still running (its JS would write cookies back on the
+  // next tick). Belt-and-suspenders: clear storage, network cache, HTTP auth
+  // cache, AND explicitly enumerate + delete every cookie on Basecamp /
+  // 37signals hosts. flushStore() at the end forces the cookie DB to disk
+  // so it doesn't get re-read from memory on the next request.
+  const sess = session.fromPartition(PARTITION);
+  try { await sess.clearStorageData(); } catch (e) {}
+  try { await sess.clearCache(); } catch (e) {}
+  try { await sess.clearAuthCache(); } catch (e) {}
+  // Some cookies (Secure / HttpOnly) need explicit removal — clearStorageData
+  // sometimes misses them. Enumerate and DELETE for each Basecamp / Launchpad
+  // host.
+  for (const domain of [
+    'basecamp.com', '.basecamp.com', 'app.basecamp.com', '3.basecamp.com',
+    'basecampapi.com', '.basecampapi.com', '3.basecampapi.com',
+    'launchpad.37signals.com', '37signals.com', '.37signals.com',
+    'preview.app.basecamp.com', 'storage.basecamp.com',
+  ]) {
+    try {
+      const cks = await sess.cookies.get({ domain });
+      for (const c of cks) {
+        const scheme = c.secure ? 'https' : 'http';
+        // cookies.remove expects a full URL where the cookie lives.
+        const dom = c.domain.startsWith('.') ? c.domain.slice(1) : c.domain;
+        const url = `${scheme}://${dom}${c.path || '/'}`;
+        try { await sess.cookies.remove(url, c.name); } catch (e) {}
+      }
+    } catch (e) {}
+  }
+  try { await sess.cookies.flushStore(); } catch (e) {}
   return { ok: true };
 });
 ipcMain.handle('open-external', (_e, url) => { if (/^https?:\/\//.test(url || '')) shell.openExternal(url); });

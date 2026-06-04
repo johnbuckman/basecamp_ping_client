@@ -463,11 +463,22 @@ window.addEventListener('keydown', (e) => { if (e.key === 'Escape') hideCtxMenu(
 window.addEventListener('blur', hideCtxMenu);
 async function signOut() {
   if (!confirm('Sign out of Basecamp? You will need to sign in again to use the app.')) return;
-  await bp.signOut();
+  // Stop polling + blank the webview FIRST. If we clear cookies while
+  // Basecamp's JS is still running it can race and re-write the session
+  // cookies before our clear completes — leaving the right pane logged in.
   if (peopleTimer) { clearInterval(peopleTimer); peopleTimer = null; }
+  try { frame.src = 'about:blank'; } catch (e) {}
+  // Clear bping's per-user state in this renderer (marked-replied flags,
+  // active selection, caches). Otherwise a different user signing in after
+  // this would inherit the previous user's chat-row markings.
   current = null; peopleData = []; peopleSig = null; knownUnread = null;
   readLocally.clear();
-  try { frame.src = 'about:blank'; } catch (e) {}
+  markedReplied.clear();
+  try { localStorage.removeItem('bping:markedReplied'); } catch (e) {}
+  try { urlBar.textContent = ''; } catch (e) {}
+  // Now ask main to wipe OAuth tokens, account config, AND the webview's
+  // Basecamp session (cookies / cache / HTTP-auth / per-host cookie sweep).
+  await bp.signOut();
   $('#title').textContent = 'Select a ping — the real Basecamp chat loads here';
   $('#hint').style.display = '';
   $('#list').innerHTML = '<div class="empty">Loading…</div>';
