@@ -587,13 +587,25 @@ function createWindow() {
 // links and Basecamp links. Opening a ping uses webview.src (a programmatic load),
 // which does NOT fire will-navigate, so the selected conversation still loads in
 // the pane; only user-clicked links are intercepted here.
+//
+// EXCEPTION: the login flow MUST stay in the webview, otherwise its session
+// cookies land in the wrong place (the system browser instead of
+// persist:basecamp). Previously, when a fresh user clicked "Sign in with
+// Google" on Launchpad's form, will-navigate killed the POST and re-opened
+// the URL in the system browser as a bare GET → Launchpad 404'd
+// (`/google_sign_in/authorization` requires the form POST). So we whitelist
+// Launchpad + the OAuth providers Launchpad supports.
+const AUTH_HOSTS = /^https:\/\/(launchpad\.37signals\.com|accounts\.google\.com|appleid\.apple\.com|login\.microsoftonline\.com|login\.live\.com|github\.com)\//i;
+
 app.on('web-contents-created', (_e, contents) => {
   if (contents.getType() !== 'webview') return;
   contents.setWindowOpenHandler(({ url }) => {            // target=_blank / popups
+    if (AUTH_HOSTS.test(url)) return { action: 'allow' };  // OAuth popup → stay in-app
     if (/^https?:\/\//i.test(url)) shell.openExternal(url);
     return { action: 'deny' };
   });
-  contents.on('will-navigate', (ev, url) => {             // any user-clicked link
+  contents.on('will-navigate', (ev, url) => {             // any user-clicked link / form submit
+    if (AUTH_HOSTS.test(url)) return;                     // login flow stays in the webview
     if (/^https?:\/\//i.test(url)) { ev.preventDefault(); shell.openExternal(url); }
   });
 });
