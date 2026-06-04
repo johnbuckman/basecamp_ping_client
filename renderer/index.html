@@ -68,13 +68,6 @@
   #bar .title { font-weight: 700; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   #bar button { border: 1px solid var(--line); background: #fff; border-radius: 6px; padding: 5px 10px; cursor: pointer; font-size: 12px; }
   #bar button:hover { background: #f0efed; }
-  /* Webview URL bar — always visible, narrow strip below the toolbar. Helps
-     debug login / navigation issues without opening DevTools. */
-  #urlBar { padding: 4px 14px; background: #f5f4f1; color: var(--muted); border-bottom: 1px solid var(--line);
-            font: 11px/1.3 -apple-system, "SF Mono", Menlo, monospace;
-            white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-            user-select: text; cursor: text; min-height: 18px; }
-  #urlBar:empty::before { content: '—'; opacity: .5; }
   #frameWrap { flex: 1; position: relative; }
   webview { width: 100%; height: 100%; border: 0; }
   #hint { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--muted); text-align: center; padding: 40px; pointer-events: none; }
@@ -148,7 +141,6 @@
         <button id="copyBtn" title="Copy messages you bookmarked in Basecamp to the clipboard (rich text + plain text)">Copy ⧉</button>
         <button id="openExt">Open in browser ↗</button>
       </div>
-      <div id="urlBar" title="Click to select; ⌘C to copy"></div>
       <div id="frameWrap">
         <webview id="bc" partition="persist:basecamp" allowpopups src="about:blank"></webview>
         <div id="hint">Click a person on the left to open your real Basecamp ping here<br>(full features: boosts, replies, attachments, read receipts)</div>
@@ -475,7 +467,6 @@ async function signOut() {
   readLocally.clear();
   markedReplied.clear();
   try { localStorage.removeItem('bping:markedReplied'); } catch (e) {}
-  try { urlBar.textContent = ''; } catch (e) {}
   // Now ask main to wipe OAuth tokens, account config, AND the webview's
   // Basecamp session (cookies / cache / HTTP-auth / per-host cookie sweep).
   await bp.signOut();
@@ -912,18 +903,10 @@ async function runCopy() {
 $('#forwardBtn').onclick = openForward;
 $('#copyBtn').onclick = openCopy;
 
-// Webview URL bar — show the chat <webview>'s current URL at all times so
-// users can see what page they're actually on (especially useful when login /
-// navigation goes sideways and the page renders something unexpected).
-// Also surfaces in screenshots so the user doesn't have to dig for it.
-const urlBar = $('#urlBar');
-function setUrlBar(u) { urlBar.textContent = u && u !== 'about:blank' ? u : ''; }
-frame.addEventListener('did-navigate',         e => setUrlBar(e.url));
-frame.addEventListener('did-navigate-in-page', e => setUrlBar(e.url));
-frame.addEventListener('did-finish-load',      () => { try { setUrlBar(frame.getURL()); } catch (e) {} });
-frame.addEventListener('did-fail-load',        e => {
-  // -3 (ABORTED) fires whenever we cancel a navigation in main (e.g. divert to
-  // system browser) — that's expected, not a real failure. Surface real ones.
+// Log real (non-aborted) webview load failures to the main-window console.
+// ERR_ABORTED (-3) fires every time main.js diverts a navigation to the
+// system browser — that's expected, not a real failure.
+frame.addEventListener('did-fail-load', e => {
   if (e.errorCode === -3) return;
   console.warn('[webview did-fail-load]', e.errorCode, e.errorDescription, e.validatedURL);
 });
