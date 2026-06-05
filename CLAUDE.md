@@ -230,6 +230,19 @@ away from the app makes rows flip back to (new). Critical and easy to break.
 1. **`will-navigate` does NOT fire for programmatic `webview.src` loads** —
    verified by a small Electron test. Means we can `e.preventDefault()` every
    user-clicked link without breaking our own ping-loading.
+   **HOWEVER**: `will-navigate` DOES fire for form submissions (POST) and JS
+   `window.location` redirects. v1.0.14 and earlier intercepted ALL of these
+   — which killed Launchpad's "Sign in with Google" form POST for fresh users
+   (re-issuing it as a bare GET via `shell.openExternal` → Launchpad 404)
+   AND blocked Launchpad's `window.location = "3.basecamp.com/<acct>"`
+   post-login redirect (leaving the webview parked on the "Logging you in…"
+   page forever, session cookies in the system browser instead of
+   `persist:basecamp`). Fixed in v1.0.15–v1.0.16 by whitelisting `AUTH_HOSTS`
+   (launchpad, accounts.google.com, appleid.apple.com, login.microsoftonline.com,
+   login.live.com, github.com) AND allowing `auth-host → basecamp.com`
+   transitions. Existing users never hit this because their session was
+   already in `persist:basecamp` and Basecamp's 302 skipped Launchpad
+   entirely.
 2. **`spctl --assess` on an unsigned/ad-hoc app says "Unnotarized Developer ID"**
    even though signing succeeded. Real test: `xcrun stapler validate` after
    `build-dmg.sh`.
@@ -241,6 +254,25 @@ away from the app makes rows flip back to (new). Critical and easy to break.
 6. **The "manual mark as replied" expiry must only fire on lastDate ADVANCE**,
    not any change. Light-mode polls regress lastDate (no latest-line correction),
    and a strict-equality check incorrectly expires manual marks. Fixed.
+7. **Sign-out wiping the webview needs more than `session.clearStorageData()`**:
+   that races with Basecamp's running JS (which rewrites cookies before the
+   clear lands) and misses Secure/HttpOnly cookies. Pattern in v1.0.18+:
+   renderer navigates `frame.src='about:blank'` BEFORE calling `bp.signOut()`;
+   main does `clearStorageData` + `clearCache` + `clearAuthCache` + an
+   explicit per-host `cookies.get` → `cookies.remove` sweep across every
+   basecamp.com / basecampapi.com / 37signals.com domain + `cookies.flushStore()`.
+   Renderer also clears `markedReplied` and `localStorage['bping:markedReplied']`
+   so a different user signing in afterwards doesn't inherit the prior user's
+   "(replied)" flags.
+8. **Forward feature limitations** (`bc-attachment` and `<img>` in clipboard
+   HTML): Basecamp's Trix doc/comment editor strips `<img>` tags on paste
+   (both external URLs AND `data:` URIs). It also won't expand
+   `<bc-attachment sgid="...">` for orphan Attachments (ones not bound to a
+   parent recording). So there is NO reliable way to inline-paste images
+   from clipboard HTML into Basecamp docs — only filename `<a href>` links
+   survive. Current Copy uses `<img src="data:...">` anyway as a hopeful
+   fallback (in case a future Basecamp release relaxes the sanitizer), with
+   the filename link below as a guaranteed survivor.
 
 ## How recipients install
 
