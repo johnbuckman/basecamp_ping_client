@@ -153,6 +153,7 @@ const $ = s => document.querySelector(s);
 const bp = window.bping;
 let current = null, peopleSig = null, peopleTimer = null;
 let peopleData = [];
+let myself = null;   // current user { id, name } — for the "wrote to YY" forward header
 const readLocally = new Set();   // chats opened this session — kept 'read' until the server catches up
 let focusComposer = false;       // after opening a ping, focus Basecamp's compose box once it loads
 let knownUnread = null;          // chatId -> lastDate from previous poll, to detect newly-arrived pings
@@ -286,6 +287,7 @@ async function loadPeople(opts) {
   let data;
   try { data = await bp.getPings({ light: useLight }); } catch (e) { $('#list').innerHTML = '<div class="empty">Failed to load.</div>'; return; }
   if (data.error) { $('#list').innerHTML = '<div class="empty">' + esc(data.error) + '</div>'; return; }
+  if (data.me) myself = data.me;   // remember who "I" am for the forward header
   // Carry over knowledge from the previous poll. Background "light" polls skip
   // the latest-line refinement — so they return lastMine=undefined, a regressed
   // lastDate, and an excerpt without any "You: " prefix. Without this merge, a
@@ -716,15 +718,25 @@ function lineBodyText(line) {
   return parts.join('\n\n');
 }
 
-// HTML "Name wrote:" lead line. The author's profile is linked so the
-// recipient can click through to ping them directly.
-function fwdHeaderHtml(creator) {
+// Who originally RECEIVED a message in the open ping: if I wrote it, the ping
+// partner (current.name); otherwise me. (current.name is comma-joined for group
+// pings, so a message I sent to a group reads "Me wrote to A, B".)
+function fwdRecipientName(creator) {
+  const cid = creator && creator.id;
+  if (myself && cid === myself.id) return (current && current.name) || 'them';
+  return (myself && myself.name) || 'me';
+}
+
+// HTML "Name wrote to Recipient:" lead line. The author's profile is linked so
+// the forwarded-message reader can click through to ping them directly.
+function fwdHeaderHtml(creator, recipientName) {
   const c = creator || {};
   const url = c.profile_url || '';
   const safeName = esc(c.name || 'Someone');
+  const to = esc(recipientName || '');
   return url
-    ? `<div><a href="${esc(url)}">${safeName} wrote:</a></div>`
-    : `<div><strong>${safeName} wrote:</strong></div>`;
+    ? `<div><a href="${esc(url)}">${safeName}</a> wrote to ${to}:</div>`
+    : `<div><strong>${safeName} wrote to ${to}:</strong></div>`;
 }
 
 // Compose the rich-text forward/copy payload.
@@ -743,7 +755,7 @@ function composeForwardHtml(lines, opts) {
     if (!body) continue;   // genuinely-empty line — defensive, shouldn't happen
     let block = '';
     if (c.id !== lastCreatorId) {
-      block += fwdHeaderHtml(c);
+      block += fwdHeaderHtml(c, fwdRecipientName(c));
       lastCreatorId = c.id;
     }
     block += `<blockquote>${body}</blockquote>`;
