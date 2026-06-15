@@ -23,12 +23,20 @@ Sidebar of pings sorted unread-first, then by recency. Click a row → the real 
 
 Grab the latest `bping-v<version>.dmg` from the releases. The DMG is signed with a Developer ID Application certificate and Apple-notarized + stapled — double-click, drag to `/Applications`, launch. No Gatekeeper warning, no right-click → Open.
 
-First launch:
-1. Click **Connect to Basecamp** → your default browser opens.
-2. Sign into 37signals Launchpad as usual.
-3. The browser tab confirms "Sign-in complete" → bping picks up automatically.
-4. Pick which Basecamp account you want to use (if you're in more than one).
-5. Done — the pings list populates and the right pane logs you into Basecamp via its own webview session.
+### First launch — register your own 37signals integration
+
+bping doesn't ship with any OAuth credentials. You register a free 37signals Launchpad integration once (takes ~30 seconds), and bping stores the Client ID + Secret in `~/Library/Application Support/bping/config.json` on your machine.
+
+1. Launch bping. The setup screen prompts for OAuth credentials.
+2. Click the **launchpad.37signals.com/integrations** link → your default browser opens.
+3. Click **New integration**. Name it whatever (e.g. "bping on my laptop"). For **Redirect URI**, paste the value bping shows in the Redirect URI field (default: `http://localhost:8089/oauth/callback`). Save.
+4. Copy the **Client ID** and **Client Secret** from the integration's detail page, paste into bping, click **Save & continue**.
+5. Click **Connect to Basecamp** → your default browser opens to authorize.
+6. Sign into Launchpad as usual. The browser tab confirms "Sign-in complete" → bping picks up automatically.
+7. Pick which Basecamp account you want to use (if you're in more than one).
+8. Done — the pings list populates and the right pane logs you into Basecamp via its own webview session.
+
+To edit the OAuth credentials later (rotate a leaked secret, switch to a different integration), click the **⚙** button in the sidebar header. Changing credentials clears the current token and bounces you back to the Connect screen.
 
 ## Build from source
 
@@ -53,11 +61,9 @@ To run locally without packaging: `npm start`.
 
 ## OAuth setup
 
-The OAuth client ID and secret are baked into `main.js` (ROT19-obfuscated to keep them out of plain `strings`/`grep`). They're for a 37signals Launchpad integration owned by the developer.
+Each user registers their own free 37signals Launchpad integration and enters its Client ID + Secret on bping's setup screen. The credentials are saved to `~/Library/Application Support/bping/config.json` on that user's machine — **never committed to source control, never shared**. See the "First launch" section above.
 
-To rotate: register a new integration at <https://launchpad.37signals.com/integrations>, set its Redirect URI to `http://localhost:8089/oauth/callback`, and replace the two ROT19-encoded constants at the top of `main.js`.
-
-To use a different integration: pass `--scope full` or use the in-app setup screen (currently hidden behind the baked-in defaults, but the `creds:save` IPC handler is wired and will overwrite `config.clientId` / `config.clientSecret` on disk).
+To rotate or switch integrations: click the **⚙** button in the sidebar. The form pre-fills the current Client ID (the secret field shows "(leave blank to keep current)" — fill it only if you're replacing the secret). Saving with changed credentials clears the local OAuth token and forces a fresh sign-in.
 
 ## Architecture, conventions, and gotchas
 

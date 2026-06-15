@@ -127,6 +127,7 @@
     <div id="left">
       <header>
         <h1>Pings</h1>
+        <button id="settingsBtn" title="OAuth credentials (Client ID / Secret / Redirect)">⚙</button>
         <button id="acctBtn" title="Switch account">Account</button>
         <button id="signOutBtn" title="Sign out of Basecamp">Sign out</button>
         <button id="refresh">Refresh</button>
@@ -191,27 +192,47 @@ async function boot() {
   startApp(st.appHref);
 }
 
-function setupScreen(st) {
+// `mode` is 'setup' on first launch (no creds yet) OR 'settings' when the
+// user clicks ⚙ to edit existing creds. Edit mode lets the secret stay blank
+// (keeps the current one); initial setup requires it.
+function setupScreen(st, mode = 'setup') {
+  const isEdit = mode === 'settings' && st.hasSecret;
+  const secretPlaceholder = isEdit ? '(leave blank to keep current)' : 'paste your Client Secret';
+  const headline = isEdit ? 'OAuth credentials' : 'Connect Basecamp (OAuth2)';
+  const intro = isEdit
+    ? `Edit your 37signals Launchpad integration credentials. Saving will sign you out (the new credentials invalidate the current Basecamp token).`
+    : `This app talks to the Basecamp API directly. Register a free integration, then paste its credentials here. Stored locally in <code>~/Library/Application Support/bping/config.json</code> — never sent anywhere except 37signals.`;
+  const cancelBtn = isEdit ? `<button class="btn secondary" id="cancel" style="margin-top:8px;margin-left:8px">Cancel</button>` : '';
   showGate(`
-    <h2>Connect Basecamp (OAuth2)</h2>
-    <p class="note">This app talks to the Basecamp API directly. Register a free integration, then paste its credentials here.</p>
+    <h2>${headline}</h2>
+    <p class="note">${intro}</p>
     <ol class="note" style="margin:0 0 8px 18px;padding:0">
       <li>Open <a id="reg">launchpad.37signals.com/integrations</a> and create an integration.</li>
       <li>Set its <b>Redirect URI</b> to exactly the value below.</li>
       <li>Copy the Client ID &amp; Client Secret here.</li>
     </ol>
     <label>Client ID</label><input id="cid" value="${esc(st.clientId)}" placeholder="...">
-    <label>Client Secret</label><input id="csec" type="password" placeholder="...">
+    <label>Client Secret</label><input id="csec" type="password" placeholder="${esc(secretPlaceholder)}">
     <label>Redirect URI (must match your integration)</label><input id="ruri" value="${esc(st.redirectUri || st.defaultRedirect)}">
     <div class="err" id="err"></div>
-    <button class="btn" id="save">Save &amp; continue</button>
+    <button class="btn" id="save">${isEdit ? 'Save changes' : 'Save &amp; continue'}</button>
+    ${cancelBtn}
   `);
   $('#reg').onclick = () => bp.openExternal('https://launchpad.37signals.com/integrations');
+  if (cancelBtn) $('#cancel').onclick = () => { hideGate(); boot(); };
   $('#save').onclick = async () => {
-    const clientId = $('#cid').value.trim(), clientSecret = $('#csec').value.trim(), redirectUri = $('#ruri').value.trim();
-    if (!clientId || !clientSecret) { $('#err').textContent = 'Client ID and Secret are required.'; return; }
-    await bp.saveCreds({ clientId, clientSecret, redirectUri });
-    connectScreen();
+    const clientId = $('#cid').value.trim();
+    const clientSecret = $('#csec').value.trim();
+    const redirectUri = $('#ruri').value.trim();
+    if (!clientId) { $('#err').textContent = 'Client ID is required.'; return; }
+    if (!isEdit && !clientSecret) { $('#err').textContent = 'Client Secret is required.'; return; }
+    const r = await bp.saveCreds({ clientId, clientSecret, redirectUri });
+    if (r && r.error) { $('#err').textContent = r.error; return; }
+    // If creds changed, main wiped tokens — go to connectScreen. Otherwise
+    // the redirect URI might have been adjusted; reboot picks up state.
+    if (r && r.credsChanged) return connectScreen();
+    hideGate();
+    boot();
   };
 }
 
@@ -424,6 +445,13 @@ $('#reload').onclick = () => { try { frame.reload(); } catch (e) {} };
 $('#openExt').onclick = () => { if (current) bp.openExternal(current.appUrl); };
 $('#acctBtn').onclick = pickerScreen;
 $('#signOutBtn').onclick = signOut;
+// ⚙ → re-open the OAuth-credentials form with current values pre-filled.
+// Saving with changed creds will clear tokens and bounce to connectScreen;
+// Cancel leaves everything as-is.
+$('#settingsBtn').onclick = async () => {
+  const st = await bp.getState();
+  setupScreen(st, 'settings');
+};
 // Clicking a system notification focuses the app and opens that conversation.
 bp.onNotifyClick(({ chat }) => {
   if (!chat) return;

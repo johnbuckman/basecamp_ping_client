@@ -12,19 +12,10 @@ const http = require('http');
 const LAUNCHPAD = 'https://launchpad.37signals.com';
 const API_ROOT = 'https://3.basecampapi.com';
 const DEFAULT_REDIRECT = 'http://localhost:8089/oauth/callback';
-// Baked-in 37signals OAuth integration credentials. ROT19-obfuscated so the raw
-// secret doesn't show up in `strings`/`grep` of the bundle. This is OBFUSCATION,
-// NOT ENCRYPTION — trivial to reverse by anyone reading this file.
-// The strings below are the originals shifted +19 in the a–z alphabet (digits
-// untouched); rot19() reverses with the inverse shift (+7 mod 26).
-function rot19(s) {
-  return s.replace(/[a-z]/g, c => String.fromCharCode((c.charCodeAt(0) - 97 + 7) % 26 + 97));
-}
-const OAUTH = {
-  clientId: rot19('456t4707vt4905v5x649vyt66ux7u71xt2w64043'),
-  clientSecret: rot19('1u06y631644wy261377100v709u0vv86uw5475t3'),
-  redirectUri: 'http://localhost:8089/oauth/callback',
-};
+// OAuth credentials are NOT baked into the binary — each user registers their
+// own free 37signals Launchpad integration and enters its Client ID + Secret
+// on the setup screen (or via the ⚙ button to re-edit later). Stored at
+// userData/config.json on their own machine, never in source control.
 const UA = 'Basecamp Pings Native (https://decentespresso.com)';
 const PARTITION = 'persist:basecamp';   // shared by the auth window and the chat webview → one login
 const READ_PAGES = 6;
@@ -431,15 +422,36 @@ ipcMain.handle('state:get', () => ({
   accountId: config.accountId || null,
   appHref: config.appHref || null,
   clientId: config.clientId || '',
+  hasSecret: !!config.clientSecret,    // lets the settings UI hint "(unchanged)" instead of revealing the secret
   redirectUri: redirectUri(),
   defaultRedirect: DEFAULT_REDIRECT,
 }));
-ipcMain.handle('creds:save', (_e, c) => {
-  config.clientId = (c.clientId || '').trim();
-  config.clientSecret = (c.clientSecret || '').trim();
-  config.redirectUri = (c.redirectUri || '').trim() || DEFAULT_REDIRECT;
+ipcMain.handle('creds:save', async (_e, c) => {
+  const newClientId  = (c && c.clientId || '').trim();
+  const newSecret    = (c && c.clientSecret || '').trim();
+  const newRedirect  = (c && c.redirectUri || '').trim() || DEFAULT_REDIRECT;
+  if (!newClientId) return { error: 'Client ID is required' };
+  // Blank secret in EDIT mode → keep the existing one. In INITIAL setup mode
+  // (no secret saved yet), the renderer enforces non-blank before calling us.
+  if (!newSecret && !config.clientSecret) return { error: 'Client Secret is required' };
+  const credsChanged =
+    config.clientId !== newClientId ||
+    (newSecret && config.clientSecret !== newSecret) ||
+    config.redirectUri !== newRedirect;
+  config.clientId = newClientId;
+  if (newSecret) config.clientSecret = newSecret;
+  config.redirectUri = newRedirect;
   writeJSON(CFG_PATH, config);
-  return { ok: true };
+  // Any change to clientId/secret/redirect invalidates the current token —
+  // it was issued by a different OAuth integration (or with a different
+  // redirect URI). Clear tokens and force re-auth on the next state:get.
+  if (credsChanged) {
+    tokens = {};
+    try { fs.unlinkSync(TOK_PATH); } catch (e) {}
+    me = null; identityCache = null;
+    peopleCache = { at: 0, list: [] };
+  }
+  return { ok: true, credsChanged };
 });
 ipcMain.handle('auth:start', async () => {
   try { await authInteractive(); return await listAccounts(); }
@@ -660,12 +672,8 @@ app.on('web-contents-created', (_e, contents) => {
 app.whenReady().then(() => {
   CFG_PATH = path.join(app.getPath('userData'), 'config.json');
   TOK_PATH = path.join(app.getPath('userData'), 'tokens.json');
-  config = readJSON(CFG_PATH);   // preserves accountId/appHref across launches
+  config = readJSON(CFG_PATH);   // { clientId, clientSecret, redirectUri, accountId, appHref }
   tokens = readJSON(TOK_PATH);
-  // Force baked-in OAuth credentials on every launch (overrides anything saved).
-  config.clientId = OAUTH.clientId;
-  config.clientSecret = OAUTH.clientSecret;
-  config.redirectUri = OAUTH.redirectUri;
   createWindow();
 });
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });

@@ -71,25 +71,39 @@ to Applications, no Gatekeeper warning, no right-click-to-open.
 - **App is zipped before notary upload** (`ditto -c -k --keepParent`), but the staple
   goes on the unzipped `.app`. Notary verdict is checked for `"status: Accepted"`.
 
-## OAuth2 setup (baked-in)
+## OAuth2 setup (per-user, BYO credentials)
 
-- 37signals integration registered at `launchpad.37signals.com/integrations`
-- Client ID + Secret are **hardcoded in `main.js`** (`OAUTH` const), **ROT19-obfuscated**
-  via a tiny `rot19()` decoder that applies `+7 mod 26` to lowercase letters (the inverse
-  of the +19 encoding shift). This hides the literal strings from `grep`/`strings` of the
-  bundle — it is NOT encryption; anyone reading `main.js` can reverse it. Trusted-distribution
-  trade-off the user accepted. To rotate, regenerate at launchpad.37signals.com/integrations
-  and replace the two encoded constants.
-- Redirect URI: `http://localhost:8089/oauth/callback` (must match what's registered)
-- Auth flow: **opens system browser** via `shell.openExternal` (so passkeys + existing
-  Basecamp session work). Embedded HTTP server on `127.0.0.1:8089` receives the
-  callback. The auth flow used to use an in-app `BrowserWindow`, but passkeys don't
-  work in embedded Chromium — that's why it was switched.
-- A `state:get` IPC reports `{configured, authed, accountId, appHref, redirectUri}` —
-  the renderer's state machine drives the gate (`setupScreen` / `connectScreen` /
-  `pickerScreen` / main app).
-- Tokens stored at `<userData>/tokens.json`; account info at `<userData>/config.json`.
-  `userData` resolves to `~/Library/Application Support/bping/`.
+- **No baked-in credentials.** Each user registers their own free 37signals
+  Launchpad integration at `launchpad.37signals.com/integrations` and enters
+  its Client ID + Secret on the first-launch setup screen. We had ROT19-obfuscated
+  baked-in creds historically; they were removed when the repo went public —
+  search engines + credential scanners would extract them in minutes.
+- Credentials stored at `<userData>/config.json` (`~/Library/Application Support/bping/`)
+  on each user's own machine, never in source control.
+- Setup screen reachable two ways:
+  - **First launch** (no creds saved) — `boot()` sees `!st.configured` and
+    routes to `setupScreen(st, 'setup')`. Both Client ID and Client Secret
+    are required.
+  - **Settings ⚙ button** (sidebar header) — calls `setupScreen(st, 'settings')`.
+    Client Secret field shows "(leave blank to keep current)" — only set
+    a new value if rotating. Cancel button leaves things as-is.
+- Redirect URI default: `http://localhost:8089/oauth/callback` (editable in
+  the form; must match what's registered with the user's integration).
+- Auth flow: **opens system browser** via `shell.openExternal` (so passkeys
+  + existing Basecamp session work). Embedded HTTP server on `127.0.0.1:8089`
+  receives the callback. The auth flow used to use an in-app `BrowserWindow`,
+  but passkeys don't work in embedded Chromium — that's why it was switched.
+- `creds:save` IPC: blank `clientSecret` in edit mode keeps the existing one.
+  If any of `clientId` / `clientSecret` / `redirectUri` actually changed,
+  the IPC clears `tokens` + deletes `tokens.json` (new creds invalidate the
+  old token) and returns `{ok:true, credsChanged:true}` so the renderer
+  bounces to `connectScreen()` for a fresh sign-in.
+- `state:get` reports `{configured, authed, accountId, appHref, clientId,
+  hasSecret, redirectUri, defaultRedirect}` — the renderer's state machine
+  drives the gate (`setupScreen` / `connectScreen` / `pickerScreen` /
+  main app); `hasSecret` lets the settings UI show the "(unchanged)" hint
+  without revealing the actual secret value.
+- Tokens stored at `<userData>/tokens.json`; per-user config at `<userData>/config.json`.
 
 ## Architecture / data flow
 
