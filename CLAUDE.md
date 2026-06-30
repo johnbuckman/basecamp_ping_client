@@ -44,7 +44,7 @@ a separate step. Older `bping-v*.dmg` files are removed from `dist/`,
 `~/Documents/bping-apps/`, and `~/Desktop/` on each successful build.
 
 **Auto-install + relaunch:** every build also quits any running bping, copies the
-new `.app` into `/Applications/bping.app` (replacing the prior one), and
+new `.app` into `/Applications/Basecamp/bping.app` (replacing the prior one), and
 relaunches it. Skip with `BPING_SKIP_INSTALL=1 ./build-dmg.sh` if you want to
 test from a DMG copy without disturbing the currently-running instance. User
 data (OAuth tokens, settings, marked-replied state) lives in `~/Library/Application Support/bping/`

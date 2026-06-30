@@ -178,12 +178,13 @@ else
       sleep 1
     fi
   fi
-  echo "==> Installing to /Applications/bping.app"
-  rm -rf /Applications/bping.app
-  cp -R "$APP" /Applications/
-  touch /Applications/bping.app
-  echo "==> Relaunching /Applications/bping.app"
-  open /Applications/bping.app
+  echo "==> Installing to /Applications/Basecamp/bping.app"
+  mkdir -p /Applications/Basecamp
+  rm -rf /Applications/Basecamp/bping.app
+  cp -R "$APP" /Applications/Basecamp/
+  touch /Applications/Basecamp/bping.app
+  echo "==> Relaunching /Applications/Basecamp/bping.app"
+  open /Applications/Basecamp/bping.app
   if [ "$WAS_RUNNING" = "1" ]; then
     echo "==> Replaced the running instance — new build is live."
   else
