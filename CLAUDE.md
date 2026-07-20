@@ -226,6 +226,66 @@ away from the app makes rows flip back to (new). Critical and easy to break.
 - **Sign-out** clears tokens, `accountId`, and the partition's storage so the
   next sign-in is fresh.
 
+## Windows support
+
+Every Windows behavior is gated — `process.platform === 'win32'` in main.js,
+the `.win32` class on `<html>` in the renderer's CSS. **Never change the mac
+path when touching these.** (Two behaviors below — the work-area clamp and the
+IPv6 loopback twin — are deliberately cross-platform, not gated: no-ops
+wherever the mac path already works.)
+
+- **Paths:** `userData` = `%APPDATA%\bping\` → `config.json` / `tokens.json`
+  (same `app.getPath('userData')` code as mac, different OS location).
+- **main.js (win32-only):** `app.setAppUserModelId('com.decent.bping')` early in
+  `whenReady` (without it toasts are silently dead); single-instance lock
+  (second launch would EADDRINUSE the OAuth loopback server on :8089);
+  close-to-tray — `close` is prevented + window hidden **only if the Tray was
+  successfully created** from `icon.ico` (no tray → normal close/quit; never
+  hide a window nothing can bring back); `before-quit` sets the quitting flag;
+  `Menu.setApplicationMenu(null)` win32-only (the default menu renders inside
+  the window on Windows; removing it on mac would kill Cmd+C/V); that removal
+  also strips the default DevTools accelerator, so the main window re-binds it
+  via `before-input-event` (F12 / Ctrl+Shift+I — Alt excluded so
+  Ctrl+Alt+Shift+I falls through to the webview chord); BrowserWindow
+  `icon: icon.ico` when present; port-bind errors handle `EACCES`
+  (Windows excluded port ranges) alongside `EADDRINUSE`.
+- **Toast caveats:** until an installer registers a Start-menu shortcut carrying
+  the AppUserModelID, Windows may attribute toasts generically; Focus Assist /
+  notification settings can suppress them entirely (users report this as
+  "notifications broken"). If sign-in hangs on "Waiting for sign-in", the
+  user-facing fallback is registering the integration's Redirect URI with
+  `127.0.0.1` instead of `localhost`.
+- **Native dialogs (win32-only):** Electron-on-Windows leaves the keyboard dead
+  after `window.confirm`/`alert` closes, so the renderer routes through
+  `askConfirm` / `showAlert` (`IS_WIN`) → `dialog:confirm` / `dialog:alert` IPC
+  → `dialog.showMessageBox`. mac keeps native `confirm`/`alert` verbatim (all
+  three layers stay in sync: main handler, preload bridge, renderer call site).
+- **Renderer:** `.win32` class added to `documentElement` when
+  `navigator.platform` starts with `Win`; thin (10px) scrollbar CSS for
+  `#list` / `.fwd-list` is scoped under it (Windows scrollbars are always
+  visible and would narrow the fixed 320px sidebar; mac overlay scrollbars
+  untouched). Webview DevTools: Ctrl+Alt+Shift+I (⌘⌥⇧I still works on mac).
+  The setup screen renders the real config path from `state:get`'s
+  `configPath` instead of a hardcoded mac string.
+- **Cross-platform (Windows-motivated, NOT gated):** `createWindow` clamps the
+  window to the display work area — `width: Math.min(1240, wa.width)`,
+  `height: Math.min(840, wa.height)` — so small Windows laptops don't lose the
+  composer under the taskbar (no-op wherever 1240×840 fits, e.g. modern Macs).
+  The OAuth callback server also starts a best-effort IPv6 twin on `[::1]:8089`
+  (same request handler, every error swallowed, closed alongside the primary on
+  success/timeout/cancel) so a stray `::1` listener can't swallow the redirect;
+  if it can't bind, the flow proceeds exactly as before.
+- **Icon:** `tools/make-ico.js` (`npm run make-ico`, dependency-free) extracts
+  the PNG chunks ≤256px from `icon.icns` and assembles `icon.ico`
+  (PNG-compressed entries: 32/64/128/256). `icon.ico` is committed — regenerate
+  only when `icon.icns` changes. It's a runtime asset (tray + window icon), not
+  just a packaging input.
+- **Packaging:** `npm run package:win` → `dist/bping-win32-x64/bping.exe`
+  (unsigned — recipients get SmartScreen "More info → Run anyway").
+- **window-all-closed** still quits on non-darwin in code, but on win32 the
+  close-to-tray handler means the last window hides instead of closing, so
+  background polling survives; the event only fires on a real Quit.
+
 ## Important file/code conventions
 
 - Single-file renderer (HTML + inline CSS + inline `<script>`). All renderer

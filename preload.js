@@ -12,6 +12,10 @@ contextBridge.exposeInMainWorld('bping', {
   getPings: (opts) => ipcRenderer.invoke('pings:list', opts),
   signOut: () => ipcRenderer.invoke('signout'),
   openExternal: (url) => ipcRenderer.invoke('open-external', url),
+  // win32 only — renderer routes alert()/confirm() through native dialogs here
+  // (Electron-on-Windows leaves keyboard input dead after window.alert/confirm).
+  confirm: (msg) => ipcRenderer.invoke('dialog:confirm', msg),
+  alert: (msg) => ipcRenderer.invoke('dialog:alert', msg),
   isFocused: () => ipcRenderer.invoke('app:focused'),
   onFocusChanged: (cb) => ipcRenderer.on('focus-changed', (_e, focused) => cb(!!focused)),
   onMessageSent: (cb) => ipcRenderer.on('message-sent', () => cb()),
