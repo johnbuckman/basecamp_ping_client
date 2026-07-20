@@ -59,6 +59,21 @@ Skip the auto-install step with `BPING_SKIP_INSTALL=1`.
 
 To run locally without packaging: `npm start`.
 
+## Windows
+
+bping also runs on Windows (same codebase, platform differences are gated on `process.platform`):
+
+- **Run from source:** `npm install`, then `npm start`.
+- **Config path:** credentials and tokens live in `%APPDATA%\bping\` (`config.json`, `tokens.json`) instead of `~/Library/Application Support/bping/`. The setup screen shows the exact path for your machine.
+- **Close-to-tray:** closing the window hides bping to the system tray so ping polling and notifications keep running (that's the whole point of the app). Reopen from the tray icon; quit via the tray menu's **Quit**.
+- **Notifications** arrive as Windows toasts; clicking one restores the window and opens that conversation.
+- **Toast attribution:** until an installer registers a Start-menu shortcut carrying bping's AppUserModelID, Windows may attribute toasts to a generic app name. If toasts don't show up at all, check **Focus Assist** and your Windows notification settings.
+- **Single instance:** launching bping while it's already running focuses the existing window instead of starting a second copy.
+- **Blocked OAuth port:** if Windows has reserved port 8089 (excluded port ranges), sign-in fails with a "port blocked" message — change the Redirect URI port in **⚙** settings *and* in your 37signals integration.
+- **Sign-in hangs on "Waiting for sign-in":** register your integration's Redirect URI with `127.0.0.1` instead of `localhost` (an IPv6 loopback edge case).
+- **Build a Windows app:** `npm run make-ico` regenerates `icon.ico` from `icon.icns` (already committed; only needed when `icon.icns` changes), then `npm run package:win` → `dist/bping-win32-x64\bping.exe`.
+- **SmartScreen caveat:** the exe is unsigned, so first launch shows "Windows protected your PC" — click **More info → Run anyway**.
+
 ## OAuth setup
 
 Each user registers their own free 37signals Launchpad integration and enters its Client ID + Secret on bping's setup screen. The credentials are saved to `~/Library/Application Support/bping/config.json` on that user's machine — **never committed to source control, never shared**. See the "First launch" section above.
@@ -77,7 +92,7 @@ See [`CLAUDE.md`](./CLAUDE.md) for the full project doc:
 
 ## Stack
 
-- [Electron](https://www.electronjs.org/) for the cross-platform wrapper (currently macOS-only build target).
+- [Electron](https://www.electronjs.org/) for the cross-platform wrapper (macOS and Windows build targets).
 - 37signals Launchpad OAuth2 (no PKCE — Launchpad requires the client secret).
 - Direct Basecamp 4 API calls via `fetch` with bearer tokens — no third-party SDK.
 - Pure HTML/CSS/vanilla JS for the renderer. No framework.

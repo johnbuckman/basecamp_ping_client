@@ -4,7 +4,7 @@
 // from /authorization.json. Right pane still embeds the real Basecamp chat in a
 // <webview> (sharing the same login session).
 
-const { app, BrowserWindow, ipcMain, session, shell, Notification, clipboard } = require('electron');
+const { app, BrowserWindow, ipcMain, session, shell, Notification, clipboard, Menu, Tray, screen, dialog } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const http = require('http');
@@ -25,6 +25,14 @@ let config = {};   // { clientId, clientSecret, redirectUri, accountId, appHref 
 let tokens = {};   // { access_token, refresh_token, expires_at }
 let identityCache = null;
 let mainWin = null;
+let tray = null;       // win32 only — set in whenReady if icon.ico exists; close-to-tray requires it
+let quitting = false;  // set on every intended-quit path so the win32 'close' handler lets the window die
+const ICO_PATH = path.join(__dirname, 'icon.ico');   // built by tools/make-ico.js; may be absent in dev
+const focusMain = () => {
+  if (!mainWin || mainWin.isDestroyed()) return;
+  if (mainWin.isMinimized()) mainWin.restore();
+  mainWin.show(); mainWin.focus();
+};
 
 const readJSON = p => { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch (e) { return {}; } };
 const writeJSON = (p, o) => fs.writeFileSync(p, JSON.stringify(o, null, 2));
@@ -80,15 +88,16 @@ async function authInteractive() {
   let port = 8089, cbPath = '/oauth/callback';
   try { const u = new URL(ru); if (u.port) port = parseInt(u.port, 10); cbPath = u.pathname || cbPath; } catch (e) {}
 
-  let server, timer, externalReject;
+  let server, twin, timer, externalReject;
   const codePromise = new Promise((resolve, reject) => {
     externalReject = reject;
-    server = http.createServer((req, res) => {
+    const handler = (req, res) => {
       const u = new URL(req.url, `http://127.0.0.1:${port}`);
       if (u.pathname !== cbPath) { res.writeHead(404, { 'Content-Type': 'text/plain' }); res.end('not found'); return; }
       const code = u.searchParams.get('code');
       const errParam = u.searchParams.get('error');
       const ok = !errParam && !!code;
+      const errText = (errParam || 'no code received').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');   // query param reflects into HTML — escape it
       const body = '<!doctype html><meta charset="utf-8"><title>bping</title>'
         + '<style>body{font:14px/1.5 -apple-system,BlinkMacSystemFont,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#f6f5f3;color:#2b2926}'
         + '.b{text-align:center;padding:28px 36px;background:#fff;border:1px solid #e3e1dd;border-radius:14px;max-width:360px}'
@@ -96,16 +105,27 @@ async function authInteractive() {
         + '<div class="b">'
         + (ok
             ? '<h2 class="s">✓ Sign-in complete</h2><p>You can close this tab and return to bping.</p>'
-            : '<h2 class="e">Sign-in failed</h2><p>' + (errParam || 'no code received') + '</p>')
+            : '<h2 class="e">Sign-in failed</h2><p>' + errText + '</p>')
         + '</div>';
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' }); res.end(body);
       if (ok) resolve(code); else reject(new Error(errParam || 'no code received'));
-    });
+    };
+    server = http.createServer(handler);
     server.on('error', (e) => {
       if (e && e.code === 'EADDRINUSE') reject(new Error(`Port ${port} is in use — close whatever is using it and try Connect again.`));
+      else if (e && e.code === 'EACCES') reject(new Error(`Port ${port} is blocked or reserved by the OS (Windows excludes some port ranges). Pick a different port: change the Redirect URI in ⚙ settings AND in your 37signals integration, then try Connect again.`));
       else reject(e);
     });
     server.listen(port, '127.0.0.1');
+    // Best-effort IPv6 loopback twin: 'localhost' can resolve to ::1 first, and if
+    // some other process holds [::1]:port the browser would deliver the OAuth code
+    // there and sign-in would hang. Bind the same handler on ::1 too — pure
+    // opportunism: swallow every error so it can never reject/resolve the flow.
+    try {
+      twin = http.createServer(handler);
+      twin.on('error', () => {});
+      twin.listen(port, '::1');
+    } catch (e) { twin = null; }
     timer = setTimeout(() => reject(new Error('Sign-in timed out. Click Connect to try again.')), 10 * 60 * 1000);
   });
 
@@ -113,6 +133,7 @@ async function authInteractive() {
     cancel: () => {
       try { clearTimeout(timer); } catch (e) {}
       try { server.close(); } catch (e) {}
+      try { twin && twin.close(); } catch (e) {}
       externalReject(new Error('Sign-in cancelled.'));
     },
   };
@@ -128,6 +149,7 @@ async function authInteractive() {
   } finally {
     try { clearTimeout(timer); } catch (e) {}
     try { server && server.close(); } catch (e) {}
+    try { twin && twin.close(); } catch (e) {}
     activeAuth = null;
   }
 }
@@ -425,6 +447,7 @@ ipcMain.handle('state:get', () => ({
   hasSecret: !!config.clientSecret,    // lets the settings UI hint "(unchanged)" instead of revealing the secret
   redirectUri: redirectUri(),
   defaultRedirect: DEFAULT_REDIRECT,
+  configPath: CFG_PATH,                // absolute path — renderer shows it on the setup screen
 }));
 ipcMain.handle('creds:save', async (_e, c) => {
   const newClientId  = (c && c.clientId || '').trim();
@@ -470,10 +493,11 @@ ipcMain.handle('notify:show', (_e, opts) => {
       title: (opts && opts.title) || 'bping',
       body: (opts && opts.body) || '',
       silent: false,
+      ...(process.platform === 'win32' && fs.existsSync(ICO_PATH) ? { icon: ICO_PATH } : {}),
     });
     n.on('click', () => {
       try {
-        if (mainWin) { mainWin.show(); mainWin.focus(); mainWin.webContents.send('notify-clicked', { chat: opts && opts.chat }); }
+        if (mainWin) { focusMain(); mainWin.webContents.send('notify-clicked', { chat: opts && opts.chat }); }
       } catch (e) {}
     });
     n.show();
@@ -537,6 +561,16 @@ ipcMain.handle('signout', async () => {
 });
 ipcMain.handle('open-external', (_e, url) => { if (/^https?:\/\//.test(url || '')) shell.openExternal(url); });
 ipcMain.handle('app:focused', () => !!(mainWin && mainWin.isFocused()));
+// Native message boxes for the renderer. On Windows window.alert()/confirm()
+// leave keyboard input dead in Electron, so the renderer routes through these on
+// win32 (mac keeps native confirm/alert). Cross-platform safe either way.
+ipcMain.handle('dialog:confirm', async (_e, msg) => {
+  const r = await dialog.showMessageBox(mainWin, { type: 'question', message: String(msg || ''), buttons: ['OK', 'Cancel'], defaultId: 0, cancelId: 1 });
+  return r.response === 0;
+});
+ipcMain.handle('dialog:alert', async (_e, msg) => {
+  await dialog.showMessageBox(mainWin, { type: 'info', message: String(msg || ''), buttons: ['OK'] });
+});
 
 // --- Forward feature IPC ----------------------------------------------------
 ipcMain.handle('bookmarks:list', async (_e, opts = {}) => {
@@ -618,13 +652,38 @@ function createWindow() {
   stripFraming(session.fromPartition(PARTITION));
   stripFraming(session.defaultSession);
   watchForSends(session.fromPartition(PARTITION));
+  // Clamp to the work area — common Windows laptops (1920×1080 @150% → 1280×720
+  // logical) are smaller than the fixed 1240×840, cutting the composer off under
+  // the taskbar. No-op wherever 1240×840 fits (all modern Macs).
+  const wa = screen.getPrimaryDisplay().workAreaSize;
   mainWin = new BrowserWindow({
-    width: 1240, height: 840, title: 'Basecamp Pings — Native',
+    width: Math.min(1240, wa.width), height: Math.min(840, wa.height), title: 'Basecamp Pings — Native',
+    ...(process.platform === 'win32' && fs.existsSync(ICO_PATH) ? { icon: ICO_PATH } : {}),
     webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, webviewTag: true },
   });
   mainWin.loadFile(path.join(__dirname, 'renderer', 'index.html'));
   mainWin.on('focus', () => mainWin.webContents.send('focus-changed', true));
   mainWin.on('blur', () => mainWin.webContents.send('focus-changed', false));
+  // win32: closing the window would kill background ping polling (the app's
+  // whole point) — hide to tray instead. Only when the tray actually exists;
+  // with no tray the close proceeds normally (window-all-closed → quit).
+  mainWin.on('close', (e) => {
+    if (process.platform === 'win32' && tray && !quitting) { e.preventDefault(); mainWin.hide(); }
+  });
+  mainWin.on('session-end', () => { quitting = true; });   // Windows shutdown/logoff — never block it
+  // win32: Menu.setApplicationMenu(null) drops the default Ctrl+Shift+I / F12
+  // accelerators, so restore DevTools for the MAIN window (the renderer's own
+  // shortcut only opens the webview's).
+  if (process.platform === 'win32') {
+    mainWin.webContents.on('before-input-event', (e, input) => {
+      if (input.type !== 'keyDown') return;
+      // !alt: Ctrl+Alt+Shift+I must fall through to the page — it's the
+      // renderer's webview-DevTools chord.
+      if (input.key === 'F12' || (input.control && input.shift && !input.alt && input.key.toLowerCase() === 'i')) {
+        mainWin.webContents.toggleDevTools(); e.preventDefault();
+      }
+    });
+  }
 }
 
 // Links clicked in the chat <webview> open in the system browser — both external
@@ -669,12 +728,48 @@ app.on('web-contents-created', (_e, contents) => {
   });
 });
 
+// win32 only: a second launch would EADDRINUSE the OAuth loopback port — hand
+// off to the already-running instance and focus it. NOT on macOS: dev
+// (`npm start`) and the installed bping.app share userData, so a global lock
+// would make `npm start` silently quit whenever the installed app is running.
+let gotLock = true;
+if (process.platform === 'win32') {
+  gotLock = app.requestSingleInstanceLock();
+  if (!gotLock) app.quit();
+  else app.on('second-instance', () => {
+    if (mainWin && !mainWin.isDestroyed()) focusMain();
+    else createWindow();
+  });
+}
+
 app.whenReady().then(() => {
+  if (!gotLock) return;   // losing instance is quitting — don't create a window
+  if (process.platform === 'win32') {
+    app.setAppUserModelId('com.decent.bping');   // matches --app-bundle-id; toasts are silently dropped without it
+    Menu.setApplicationMenu(null);               // default menu renders INSIDE the window on Windows; mac keeps its menu (Cmd+C/V live there)
+  }
   CFG_PATH = path.join(app.getPath('userData'), 'config.json');
   TOK_PATH = path.join(app.getPath('userData'), 'tokens.json');
   config = readJSON(CFG_PATH);   // { clientId, clientSecret, redirectUri, accountId, appHref }
   tokens = readJSON(TOK_PATH);
+  if (process.platform === 'win32' && fs.existsSync(ICO_PATH)) {
+    // Close-to-tray: only when the tray actually exists — never hide a window
+    // that has nothing left to bring it back.
+    try {
+      tray = new Tray(ICO_PATH);
+      tray.setToolTip('bping');
+      tray.setContextMenu(Menu.buildFromTemplate([
+        { label: 'Open bping', click: () => focusMain() },
+        { label: 'Quit', click: () => { quitting = true; app.quit(); } },
+      ]));
+      tray.on('click', () => focusMain());
+      tray.on('double-click', () => focusMain());
+    } catch (e) { tray = null; console.warn('bping: tray creation failed — close-to-tray disabled', e); }
+  } else if (process.platform === 'win32') {
+    console.warn('bping: icon.ico missing — close-to-tray disabled (run: npm run make-ico)');
+  }
   createWindow();
 });
+app.on('before-quit', () => { quitting = true; });
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
 app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });

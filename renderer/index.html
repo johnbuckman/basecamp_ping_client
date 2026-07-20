@@ -95,6 +95,15 @@
   .fwd-item:hover { background: #eef6f1; }
   .fwd-item .avatar { width: 28px; height: 28px; }
   .fwd-empty { padding: 14px 8px; color: var(--muted); font-size: 13px; text-align: center; }
+
+  /* Windows only (.win32 on <html>): scrollbars are always visible and ~17px wide,
+     which eats into the fixed 320px sidebar. Restyle them thin. macOS overlay
+     scrollbars are untouched — none of these selectors match without .win32. */
+  .win32 #list::-webkit-scrollbar, .win32 .fwd-list::-webkit-scrollbar { width: 10px; }
+  .win32 #list::-webkit-scrollbar-track, .win32 .fwd-list::-webkit-scrollbar-track { background: transparent; }
+  .win32 #list::-webkit-scrollbar-thumb, .win32 .fwd-list::-webkit-scrollbar-thumb {
+    background: #c9c6c0; border-radius: 5px; border: 2px solid transparent; background-clip: padding-box; }
+  .win32 #list::-webkit-scrollbar-thumb:hover, .win32 .fwd-list::-webkit-scrollbar-thumb:hover { background: #a9a6a0; }
 </style>
 </head>
 <body>
@@ -152,6 +161,13 @@
 <script>
 const $ = s => document.querySelector(s);
 const bp = window.bping;
+// Windows: the .win32 class scopes the thin-scrollbar CSS, and window.alert()/
+// confirm() are routed through native dialogs via IPC (Electron-on-Windows leaves
+// keyboard input dead after them). macOS keeps native confirm()/alert() exactly.
+const IS_WIN = navigator.platform.startsWith('Win');
+if (IS_WIN) document.documentElement.classList.add('win32');
+const askConfirm = async (msg) => IS_WIN ? await bp.confirm(msg) : confirm(msg);
+const showAlert  = async (msg) => { if (IS_WIN) await bp.alert(msg); else alert(msg); };
 let current = null, peopleSig = null, peopleTimer = null;
 let peopleData = [];
 let myself = null;   // current user { id, name } — for the "wrote to YY" forward header
@@ -201,7 +217,7 @@ function setupScreen(st, mode = 'setup') {
   const headline = isEdit ? 'OAuth credentials' : 'Connect Basecamp (OAuth2)';
   const intro = isEdit
     ? `Edit your 37signals Launchpad integration credentials. Saving will sign you out (the new credentials invalidate the current Basecamp token).`
-    : `This app talks to the Basecamp API directly. Register a free integration, then paste its credentials here. Stored locally in <code>~/Library/Application Support/bping/config.json</code> — never sent anywhere except 37signals.`;
+    : `This app talks to the Basecamp API directly. Register a free integration, then paste its credentials here. Stored locally in <code>${esc(st.configPath || 'config.json in the app data folder')}</code> — never sent anywhere except 37signals.`;
   const cancelBtn = isEdit ? `<button class="btn secondary" id="cancel" style="margin-top:8px;margin-left:8px">Cancel</button>` : '';
   showGate(`
     <h2>${headline}</h2>
@@ -484,7 +500,7 @@ window.addEventListener('click', (e) => { if (!ctxMenu.contains(e.target)) hideC
 window.addEventListener('keydown', (e) => { if (e.key === 'Escape') hideCtxMenu(); });
 window.addEventListener('blur', hideCtxMenu);
 async function signOut() {
-  if (!confirm('Sign out of Basecamp? You will need to sign in again to use the app.')) return;
+  if (!(await askConfirm('Sign out of Basecamp? You will need to sign in again to use the app.'))) return;
   // Stop polling + blank the webview FIRST. If we clear cookies while
   // Basecamp's JS is still running it can race and re-write the session
   // cookies before our clear completes — leaving the right pane logged in.
@@ -571,7 +587,7 @@ window.addEventListener('keydown', e => {
 // `verb` is shown in the empty-state hint so the user knows whether they're
 // being told to "forward" or "copy".
 async function scanCurrentChatBookmarks(verb) {
-  if (!current) { alert(`Open a ping first, then click ${verb}.`); return false; }
+  if (!current) { await showAlert(`Open a ping first, then click ${verb}.`); return false; }
   fwdSummary.innerHTML = '';
   fwdList.innerHTML = '';
   fwdSearch.style.display = 'none';
@@ -951,11 +967,11 @@ frame.addEventListener('did-fail-load', e => {
   console.warn('[webview did-fail-load]', e.errorCode, e.errorDescription, e.validatedURL);
 });
 
-// ⌘⌥⇧I opens DevTools on the chat <webview> (separate from the main window's
-// DevTools at ⌘⌥I). Useful for debugging login/navigation issues with
-// Basecamp's own JS.
+// ⌘⌥⇧I (Ctrl+Alt+Shift+I on Windows) opens DevTools on the chat <webview>
+// (separate from the main window's DevTools at ⌘⌥I). Useful for debugging
+// login/navigation issues with Basecamp's own JS.
 window.addEventListener('keydown', e => {
-  if (e.metaKey && e.altKey && e.shiftKey && (e.key === 'I' || e.key === 'i')) {
+  if ((e.metaKey || e.ctrlKey) && e.altKey && e.shiftKey && (e.key === 'I' || e.key === 'i')) {
     e.preventDefault();
     try { frame.openDevTools(); } catch (err) { console.warn('openDevTools failed:', err); }
   }
