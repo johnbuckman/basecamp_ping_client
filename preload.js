@@ -20,6 +20,7 @@ contextBridge.exposeInMainWorld('bping', {
   deleteBookmark: (bookmarkUrl) => ipcRenderer.invoke('bookmark:delete', { bookmarkUrl }),
   listPeople: () => ipcRenderer.invoke('people:list'),
   sendLine: (bucket, chat, html) => ipcRenderer.invoke('api:send-line', { bucket, chat, html }),
+  recentLines: (bucket, chat) => ipcRenderer.invoke('lines:recent', { bucket, chat }),
   writeClipboard: (text, html) => ipcRenderer.invoke('clipboard:write', { text, html }),
   reuploadAttachment: (downloadUrl, filename, mime, maxBytes) =>
     ipcRenderer.invoke('attachment:reupload', { downloadUrl, filename, mime, maxBytes }),

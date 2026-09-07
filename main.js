@@ -562,6 +562,17 @@ ipcMain.handle('api:send-line', async (_e, { bucket, chat, html } = {}) => {
   try { const line = await sendChatLine(bucket, chat, html); return { ok: true, line }; }
   catch (e) { return { error: e.message }; }
 });
+// Recent lines for a conversation (newest-first, first page). Used by the
+// renderer's per-message notification scan to find messages authored by
+// someone other than the current user since the last poll.
+ipcMain.handle('lines:recent', async (_e, { bucket, chat } = {}) => {
+  if (!config.accountId) return { error: 'no account selected' };
+  if (!bucket || !chat) return { error: 'bucket and chat required' };
+  try {
+    const lines = await api(`/buckets/${bucket}/chats/${chat}/lines.json`);
+    return { ok: true, lines: Array.isArray(lines) ? lines : [] };
+  } catch (e) { return { error: e.message }; }
+});
 ipcMain.handle('attachment:reupload', async (_e, { downloadUrl, filename, mime, maxBytes } = {}) => {
   if (!downloadUrl) return { error: 'no downloadUrl' };
   try {

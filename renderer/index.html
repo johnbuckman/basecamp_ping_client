@@ -158,6 +158,7 @@ let myself = null;   // current user { id, name } — for the "wrote to YY" forw
 const readLocally = new Set();   // chats opened this session — kept 'read' until the server catches up
 let focusComposer = false;       // after opening a ping, focus Basecamp's compose box once it loads
 let knownUnread = null;          // chatId -> lastDate from previous poll, to detect newly-arrived pings
+let lastScanAt = new Date().toISOString();  // time of the previous poll — notification boundary for brand-new conversations
 let firstLoad = true;            // auto-open the most recent ping after the first successful fetch
 // Conversations the user manually flagged as "(replied)" via the right-click menu.
 // Stored as Map<chatId, lastDateAtMarkTime>: when lastDate advances (new activity),
@@ -366,13 +367,13 @@ async function maybeAutoSelect(people) {
     const fresh = people.filter(p => p.unread &&
       (!knownUnread.has(p.chat) || new Date(p.lastDate) > new Date(knownUnread.get(p.chat))));
     if (fresh.length) {
-      // Native macOS notification for each new incoming ping.
-      fresh.forEach(p => bp.notify({
-        title: 'New ping from ' + p.name,
-        body: p.excerpt || '',
-        chat: p.chat,
-      }));
       let focused = true; try { focused = await bp.isFocused(); } catch (e) {}
+      // One macOS notification per incoming message (not per conversation),
+      // for every message authored by someone other than me since the last poll.
+      for (const p of fresh) {
+        const boundary = knownUnread.has(p.chat) ? knownUnread.get(p.chat) : lastScanAt;
+        await notifyNewMessages(p, boundary, focused);
+      }
       if (!focused) {
         fresh.sort((a, b) => new Date(b.lastDate) - new Date(a.lastDate));
         openConvo(fresh[0]);
@@ -380,6 +381,55 @@ async function maybeAutoSelect(people) {
     }
   }
   knownUnread = cur;
+  lastScanAt = new Date().toISOString();
+}
+
+// Plain-text one-liner for a chat line, for use as a notification body.
+function lineToText(l) {
+  if (!l) return '';
+  if (l.content) return htmlToText(l.content);
+  const atts = l.attachments || [];
+  if (atts.length) return '📎 ' + (atts[0].filename || atts[0].title || 'attachment');
+  return '';
+}
+
+// Fetch the recent lines for a conversation that just showed new incoming
+// activity and fire one macOS notification per message NOT authored by me and
+// newer than `boundary` (the ISO time we last scanned this chat). Notifications
+// arrive in reading order (oldest→newest). If the window is focused and this is
+// the conversation already open on screen, stay quiet — you're watching it
+// arrive. Falls back to a single excerpt notification if the line fetch fails.
+async function notifyNewMessages(p, boundary, focused) {
+  if (focused && current && String(current.chat) === String(p.chat)) return;
+  const b = new Date(boundary || 0);
+  let r = null;
+  try { r = await bp.recentLines(p.bucket, p.chat); } catch (e) { r = null; }
+  if (!r || !r.ok || !Array.isArray(r.lines)) {   // fetch failed → old per-conversation behavior
+    bp.notify({ title: 'New ping from ' + p.name, body: p.excerpt || '', chat: p.chat });
+    return;
+  }
+  const newLines = r.lines
+    .filter(l => l && l.creator && (!myself || l.creator.id !== myself.id) &&
+                 l.created_at && new Date(l.created_at) > b)
+    .sort((a, c) => new Date(a.created_at) - new Date(c.created_at));
+  if (!newLines.length) return;   // nothing new authored by someone else
+  const MAX = 5;                  // avoid a burst after being offline a while
+  if (newLines.length > MAX) {
+    const last = newLines[newLines.length - 1];
+    bp.notify({
+      title: newLines.length + ' new messages from ' + p.name,
+      body: lineToText(last) || p.excerpt || '',
+      chat: p.chat,
+    });
+    return;
+  }
+  for (const l of newLines) {
+    bp.notify({
+      title: 'New ping from ' + ((l.creator && l.creator.name) || p.name),
+      body: lineToText(l),
+      chat: p.chat,
+    });
+  }
 }
 function renderList() {
   const list = $('#list'); list.innerHTML = '';
